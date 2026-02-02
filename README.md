@@ -33,9 +33,15 @@ Note on macOS: if soundfile fails to install, install libsndfile first:
 brew install libsndfile
 pip install soundfile
 ```
+If tensorflow fails to install, Apple Silicon sometimes needs:
+
+```bash
+tensorflow-macos (and optionally tensorflow-metal)
+```
+In that case, remove the tensorflow line from requirements.txt and install the Apple packages instead.
 
 
-<h1>Running Offline Classification</h1>
+### 2) Running Offline Classification
 Run the classifier and write results to predictions.jsonl:
 
 ```bash
@@ -83,7 +89,7 @@ Each line looks like:
 - top is the ranked list of top-k labels and their probabilities.
 
 
-<h1>Visualizing Results (Streamlit Dashboard)</h1>
+### 3) Visualizing Results (Streamlit Dashboard)
 A localhost dashboard is provided via Streamlit. Input the path to the output file with JSON predictions on the Streamlit dashboard page.
 
 What it includes:
