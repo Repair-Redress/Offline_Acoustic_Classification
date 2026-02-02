@@ -1,0 +1,22 @@
+# outputs
+predictions.jsonl
+*.npz
+*.log
+
+# audio / media
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.png
+*.jpg
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.env
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
