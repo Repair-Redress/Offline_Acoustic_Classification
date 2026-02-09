@@ -1,12 +1,15 @@
 # Core numerics + audio I/O
-numpy>=1.23,<3
+numpy>=1.23,<2
 scipy>=1.10
 soundfile>=0.12
 
 # TFLite interpreter fallback (offlineclassify.py uses tf.lite.Interpreter if tflite_runtime isn't installed)
 tensorflow>=2.13,<3
 
-# Visualization app
+# Visualization apps
 streamlit>=1.28
 pandas>=2.0
 plotly>=5.18
+
+# For mp3/m4a decoding in dashboards (requires ffmpeg installed on the system)
+pydub>=0.25
