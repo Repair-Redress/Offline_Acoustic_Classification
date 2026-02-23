@@ -62,8 +62,10 @@ python offlineclassify.py --audio Recording.wav --sample_hz 1.0 --top_k 5
   * Example: 2.0 → prediction every 0.5s, 0.5 → prediction every 2s.
 * `--top_k` (default: 5): Number of top labels to save per frame.
 * `--window_s` (default: 0.975): Window size (seconds) used for each prediction.
+* `--auto-window`: Override the window size with model input length.
 * `--avg_frames` (default: 1): Temporal smoothing (averages last N frames).
 * `--out_json` (default: predictions.jsonl): Output path for results.
+* `--out_npz`: (default: predictions_full.npz): Output path for full predictions.
 * `--model` (default: yamnet.tflite): Model path.
 * `--labels` (default: yamnet_class_map.csv): Label map path.
 
@@ -73,10 +75,12 @@ python offlineclassify.py --audio Recording.wav --sample_hz 1.0 --top_k 5
 ```bash
 python offlineclassify.py \
   --audio Recording.wav \
-  --sample_hz 2.0 \
-  --avg_frames 5 \
-  --top_k 3 \
-  --out_json my_preds.jsonl
+  --sample_hz 1.0 \
+  --top_k 10 \
+  --avg_frames 3 \
+  --auto_window \
+  --out_json predictions.jsonl \
+  --out_npz predictions_full.npz
 ```
 
 <h4>Output Format</h4>

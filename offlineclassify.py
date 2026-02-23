@@ -13,6 +13,14 @@ except ImportError:
     import tensorflow as tf
     Interpreter = tf.lite.Interpreter
 
+def get_model_expected_len(model_path: str) -> int:
+    """Return expected waveform length from the model input tensor."""
+    interp = Interpreter(model_path=model_path)
+    interp.allocate_tensors()
+    input_details = interp.get_input_details()
+    # expects shape [15600] or [1,15600]
+    return int(input_details[0]["shape"][-1])
+
 def load_labels(labels_path: str):
     """
     Supports:
@@ -148,7 +156,14 @@ def main():
     ap.add_argument("--avg_frames", type=int, default=1)
     ap.add_argument("--top_k", type=int, default=5)
     ap.add_argument("--out_json", default="predictions.jsonl")
+    ap.add_argument("--out_npz", default="predictions_full.npz", help="Optional: write full t_sec + 521-dim scores to .npz")
+    ap.add_argument("--auto_window", action="store_true", help="Override window_s to match model input length")
     args = ap.parse_args()
+
+    # Ensure window matches model input length if requested
+    if args.auto_window:
+        expected_len = get_model_expected_len(args.model)
+        args.window_s = expected_len / 16000.0
 
     x, sr = sf.read(args.audio, always_2d=False)
     x = to_mono(np.asarray(x))
@@ -168,6 +183,19 @@ def main():
 
     raw_scores = run_tflite(interp, frames)
     scores = temporal_average(raw_scores, args.avg_frames)
+
+    if args.out_npz:
+        np.savez_compressed(
+            args.out_npz,
+            t_sec=t_centers.astype(np.float32),
+            scores=scores.astype(np.float32),
+            labels=np.array(labels, dtype=object),
+            sample_hz=float(args.sample_hz),
+            window_s=float(args.window_s),
+            avg_frames=int(args.avg_frames),
+            model=str(args.model),
+        )
+        print(f"[ok] wrote full scores npz -> {args.out_npz}")
 
     labels = load_labels(args.labels)
     if scores.shape[1] != len(labels):
