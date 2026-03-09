@@ -87,6 +87,74 @@ def to_mono(x: np.ndarray):
         return x
     return np.mean(x, axis=1)
 
+def split_audio_channels(x: np.ndarray):
+    x = np.asarray(x)
+
+    if x.ndim == 1:
+        return {"mono": x.astype(np.float32)}
+
+    if x.ndim != 2:
+        raise ValueError(f"Expected 1D or 2D audio array, got shape={x.shape}")
+
+    if x.shape[1] > 8 and x.shape[0] <= 8:
+        x = x.T
+
+    n_channels = x.shape[1]
+    if n_channels == 1:
+        return {"mono": x[:, 0].astype(np.float32)}
+
+    return {
+        "left": x[:, 0].astype(np.float32),
+        "right": x[:, 1].astype(np.float32),
+    }
+
+
+def classify_single_waveform(interp, x: np.ndarray, sr: int, sample_hz: float, window_s: float, avg_frames: int):
+    x = np.asarray(x, dtype=np.float32)
+
+    if np.max(np.abs(x)) > 1.5:
+        x = x / 32768.0
+
+    x = resample(x, sr, 16000)
+    hop_s = 1.0 / sample_hz
+    frames, t_centers = frame_waveform(x, 16000, window_s, hop_s)
+    raw_scores = run_tflite(interp, frames)
+    scores = temporal_average(raw_scores, avg_frames)
+    return t_centers, scores
+
+
+def write_jsonl_predictions(out_json: str, t_centers: np.ndarray, scores: np.ndarray, labels: list[str], top_k: int):
+    with open(out_json, "w") as f:
+        for t, s in zip(t_centers, scores):
+            top_idx = np.argsort(-s)[:top_k]
+            f.write(json.dumps({
+                "t_sec": float(t),
+                "top": [{"label": labels[i], "score": float(s[i])} for i in top_idx]
+            }) + "\n")
+
+
+def write_npz_predictions(out_npz: str, t_centers: np.ndarray, scores: np.ndarray, labels: list[str], args, channel_name: str):
+    np.savez_compressed(
+        out_npz,
+        t_sec=t_centers.astype(np.float32),
+        scores=scores.astype(np.float32),
+        labels=np.array(labels, dtype=object),
+        sample_hz=float(args.sample_hz),
+        window_s=float(args.window_s),
+        avg_frames=int(args.avg_frames),
+        model=str(args.model),
+        channel_mode=str(args.channel_mode),
+        channel_name=str(channel_name),
+    )
+
+
+def derive_channel_path(path: str, suffix: str) -> str:
+    if "." not in path:
+        return f"{path}_{suffix}"
+    stem, ext = path.rsplit(".", 1)
+    return f"{stem}_{suffix}.{ext}"
+
+
 def resample(x: np.ndarray, sr_in: int, sr_out: int = 16000):
     if sr_in == sr_out:
         return x
@@ -158,6 +226,12 @@ def main():
     ap.add_argument("--out_json", default="predictions.jsonl")
     ap.add_argument("--out_npz", default="predictions_full.npz", help="Optional: write full t_sec + 521-dim scores to .npz")
     ap.add_argument("--auto_window", action="store_true", help="Override window_s to match model input length")
+    ap.add_argument(
+        "--channel_mode",
+        choices=["mono_mixdown", "stereo_separate", "stereo_average"],
+        default="mono_mixdown",
+        help="How to handle stereo audio.",
+    )
     args = ap.parse_args()
 
     # Ensure window matches model input length if requested
@@ -165,52 +239,98 @@ def main():
         expected_len = get_model_expected_len(args.model)
         args.window_s = expected_len / 16000.0
 
+    labels = load_labels(args.labels)
+
     x, sr = sf.read(args.audio, always_2d=False)
-    x = to_mono(np.asarray(x))
-    x = x.astype(np.float32)
-
-    # Normalize if audio was int-based
-    if np.max(np.abs(x)) > 1.5:
-        x = x / 32768.0
-
-    x = resample(x, sr, 16000)
-
-    hop_s = 1.0 / args.sample_hz
-    frames, t_centers = frame_waveform(x, 16000, args.window_s, hop_s)
+    x = np.asarray(x)
 
     interp = Interpreter(model_path=args.model)
     interp.allocate_tensors()
 
-    raw_scores = run_tflite(interp, frames)
-    scores = temporal_average(raw_scores, args.avg_frames)
+    channels = split_audio_channels(x)
+    is_stereo = ("left" in channels and "right" in channels)
 
-    if args.out_npz:
-        np.savez_compressed(
-            args.out_npz,
-            t_sec=t_centers.astype(np.float32),
-            scores=scores.astype(np.float32),
-            labels=np.array(labels, dtype=object),
-            sample_hz=float(args.sample_hz),
-            window_s=float(args.window_s),
-            avg_frames=int(args.avg_frames),
-            model=str(args.model),
-        )
-        print(f"[ok] wrote full scores npz -> {args.out_npz}")
+    if args.channel_mode != "mono_mixdown" and not is_stereo:
+        print("[info] input is not stereo; falling back to mono_mixdown")
+        args.channel_mode = "mono_mixdown"
 
-    labels = load_labels(args.labels)
-    if scores.shape[1] != len(labels):
-        raise ValueError(
-            f"Mismatch: model outputs {scores.shape[1]} classes, but label map has {len(labels)} labels.\n"
-            f"Your categoriesFile must be the YAMNet 521-class map in the SAME index order."
+    if args.channel_mode == "mono_mixdown":
+        mono = to_mono(x).astype(np.float32)
+        t_centers, scores = classify_single_waveform(
+            interp,
+            mono,
+            sr,
+            args.sample_hz,
+            args.window_s,
+            args.avg_frames,
         )
 
-    with open(args.out_json, "w") as f:
-        for t, s in zip(t_centers, scores):
-            top_idx = np.argsort(-s)[:args.top_k]
-            f.write(json.dumps({
-                "t_sec": float(t),
-                "top": [{"label": labels[i], "score": float(s[i])} for i in top_idx]
-            }) + "\n")
+        if scores.shape[1] != len(labels):
+            raise ValueError(
+                f"Mismatch: model outputs {scores.shape[1]} classes, but label map has {len(labels)} labels."
+            )
+
+        write_jsonl_predictions(args.out_json, t_centers, scores, labels, args.top_k)
+        print(f"[ok] wrote jsonl -> {args.out_json}")
+
+        if args.out_npz:
+            write_npz_predictions(args.out_npz, t_centers, scores, labels, args, "mono")
+            print(f"[ok] wrote npz -> {args.out_npz}")
+
+    elif args.channel_mode == "stereo_separate":
+        t_left, s_left = classify_single_waveform(
+            interp, channels["left"], sr, args.sample_hz, args.window_s, args.avg_frames
+        )
+        t_right, s_right = classify_single_waveform(
+            interp, channels["right"], sr, args.sample_hz, args.window_s, args.avg_frames
+        )
+
+        if len(t_left) != len(t_right) or not np.allclose(t_left, t_right, atol=1e-4):
+            raise ValueError("Left/right channel frame grids do not align.")
+
+        if s_left.shape[1] != len(labels) or s_right.shape[1] != len(labels):
+            raise ValueError("Label count mismatch with model output.")
+
+        out_json_left = derive_channel_path(args.out_json, "left")
+        out_json_right = derive_channel_path(args.out_json, "right")
+
+        write_jsonl_predictions(out_json_left, t_left, s_left, labels, args.top_k)
+        write_jsonl_predictions(out_json_right, t_right, s_right, labels, args.top_k)
+        print(f"[ok] wrote jsonl -> {out_json_left}")
+        print(f"[ok] wrote jsonl -> {out_json_right}")
+
+        if args.out_npz:
+            out_npz_left = derive_channel_path(args.out_npz, "left")
+            out_npz_right = derive_channel_path(args.out_npz, "right")
+            write_npz_predictions(out_npz_left, t_left, s_left, labels, args, "left")
+            write_npz_predictions(out_npz_right, t_right, s_right, labels, args, "right")
+            print(f"[ok] wrote npz -> {out_npz_left}")
+            print(f"[ok] wrote npz -> {out_npz_right}")
+
+    elif args.channel_mode == "stereo_average":
+        t_left, s_left = classify_single_waveform(
+            interp, channels["left"], sr, args.sample_hz, args.window_s, args.avg_frames
+        )
+        t_right, s_right = classify_single_waveform(
+            interp, channels["right"], sr, args.sample_hz, args.window_s, args.avg_frames
+        )
+
+        if len(t_left) != len(t_right) or not np.allclose(t_left, t_right, atol=1e-4):
+            raise ValueError("Left/right channel frame grids do not align.")
+
+        scores = 0.5 * (s_left + s_right)
+
+        if scores.shape[1] != len(labels):
+            raise ValueError(
+                f"Mismatch: model outputs {scores.shape[1]} classes, but label map has {len(labels)} labels."
+            )
+
+        write_jsonl_predictions(args.out_json, t_left, scores, labels, args.top_k)
+        print(f"[ok] wrote averaged jsonl -> {args.out_json}")
+
+        if args.out_npz:
+            write_npz_predictions(args.out_npz, t_left, scores, labels, args, "avg")
+            print(f"[ok] wrote averaged npz -> {args.out_npz}")
 
 if __name__ == "__main__":
     main()

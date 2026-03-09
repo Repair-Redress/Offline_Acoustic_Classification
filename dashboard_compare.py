@@ -669,6 +669,83 @@ def to_mono(x: np.ndarray) -> np.ndarray:
         return np.mean(x, axis=1)
     return np.mean(x, axis=-1)
 
+def split_audio_channels(x: np.ndarray) -> dict[str, np.ndarray]:
+    """
+    Returns either:
+      {"mono": [n]}
+    or
+      {"left": [n], "right": [n]}
+    """
+    x = np.asarray(x)
+
+    if x.ndim == 1:
+        return {"mono": x.astype(np.float32)}
+
+    if x.ndim != 2:
+        raise ValueError(f"Expected 1D or 2D audio array, got shape={x.shape}")
+
+    # Prefer [samples, channels]. If it looks like [channels, samples], transpose.
+    if x.shape[1] > 8 and x.shape[0] <= 8:
+        x = x.T
+
+    n_channels = x.shape[1]
+
+    if n_channels == 1:
+        return {"mono": x[:, 0].astype(np.float32)}
+
+    if n_channels >= 2:
+        return {
+            "left": x[:, 0].astype(np.float32),
+            "right": x[:, 1].astype(np.float32),
+        }
+
+    raise ValueError(f"Could not interpret audio shape {x.shape}")
+
+
+def classify_single_waveform(
+    interp,
+    x: np.ndarray,
+    sr: int,
+    sample_hz: float,
+    expected_len: int,
+    avg_frames: int,
+    progress=None,
+    progress_start: float = 0.0,
+    progress_end: float = 1.0,
+    progress_text: str = "Running offline classification…",
+) -> Tuple[np.ndarray, np.ndarray]:
+    x = np.asarray(x, dtype=np.float32)
+
+    if x.size == 0:
+        raise ValueError("Empty waveform.")
+
+    # Normalize if looks like int16-ish scale
+    if np.max(np.abs(x)) > 1.5:
+        x = x / 32768.0
+
+    x = resample(x, sr, 16000)
+
+    effective_window_s = expected_len / 16000.0
+    hop_s = 1.0 / float(sample_hz)
+
+    frames, t_centers = frame_waveform(x, 16000, effective_window_s, hop_s)
+    raw_scores = run_tflite_scores(
+        interp,
+        frames,
+        progress=progress,
+        progress_start=progress_start,
+        progress_end=progress_end,
+        progress_text=progress_text,
+    )
+    scores = temporal_average(raw_scores, avg_frames)
+    return t_centers, scores
+
+
+def result_output_to_df(result: dict, output_key: str, top_k: int) -> pd.DataFrame:
+    out = result["outputs"][output_key]
+    df = scores_to_long_df(out["t_sec"], out["scores"], result["labels"], top_k=int(top_k))
+    _strip_attrs_inplace(df)
+    return df
 
 def resample(x: np.ndarray, sr_in: int, sr_out: int = 16000) -> np.ndarray:
     if sr_in == sr_out:
@@ -719,7 +796,14 @@ def load_interpreter(model_path: str):
     return interp
 
 
-def run_tflite_scores(interp, frames: np.ndarray, progress: Optional[st.progress] = None) -> np.ndarray:
+def run_tflite_scores(
+    interp,
+    frames: np.ndarray,
+    progress=None,
+    progress_start: float = 0.0,
+    progress_end: float = 1.0,
+    progress_text: str = "Running offline classification…",
+) -> np.ndarray:
     input_details = interp.get_input_details()
     output_details = interp.get_output_details()
 
@@ -737,7 +821,8 @@ def run_tflite_scores(interp, frames: np.ndarray, progress: Optional[st.progress
         scores.append(y)
 
         if progress is not None and (i % 10 == 0 or i == n - 1):
-            progress.progress((i + 1) / n)
+            frac = progress_start + (progress_end - progress_start) * ((i + 1) / n)
+            progress.progress(frac, text=progress_text)
 
     return np.stack(scores).astype(np.float32)
 
@@ -750,53 +835,161 @@ def classify_audio_bytes(
     sample_hz: float = 1.0,
     window_s: float = 0.975,
     avg_frames: int = 1,
-) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    channel_mode: str = "mono_mixdown",  # mono_mixdown | stereo_separate | stereo_average
+) -> dict :
     """
-    Returns:
-      t_centers: [T]
-      scores:    [T, 521]
-      labels:    list[str] length 521
+    Returns a dict:
+    {
+      "requested_mode": ...,
+      "effective_mode": ...,
+      "labels": [...],
+      "outputs": {
+          "mono": {"t_sec":..., "scores":...}
+          or "left"/"right"
+          or "left"/"right"/"avg"
+      },
+      "primary_key": "mono" or "avg" or None
+    }
     """
-    # Read audio (WAV/FLAC typically). MP3 may not work with soundfile.
+
     x, sr = read_audio_any_format(audio_bytes, filename=audio_name)
     x = np.asarray(x)
-    x = to_mono(x).astype(np.float32)
-
-    # Normalize if looks like int16 scale
-    if np.max(np.abs(x)) > 1.5:
-        x = x / 32768.0
-
-    x = resample(x, sr, 16000)
 
     interp = load_interpreter(model_path)
     input_details = interp.get_input_details()
-
-    # Model expects a fixed number of waveform samples (e.g., 15600 for YAMNet TFLite)
     expected_len = int(input_details[0]["shape"][-1])
-
-    # Force window length to match the model exactly
     effective_window_s = expected_len / 16000.0
 
-    # Optional: warn if user-set window_s doesn't match
     if abs(window_s - effective_window_s) > 1e-6:
         st.warning(
             f"window_s={window_s} does not match model input. "
             f"Overriding to {effective_window_s:.6f}s ({expected_len} samples)."
         )
 
-    hop_s = 1.0 / float(sample_hz)
-    frames, t_centers = frame_waveform(x, 16000, effective_window_s, hop_s)
+    channels = split_audio_channels(x)
+    is_stereo = ("left" in channels and "right" in channels)
 
-    prog = st.progress(0.0, text="Running offline classification…")
-    raw_scores = run_tflite_scores(interp, frames, progress=prog)
-    prog.empty()
+    if channel_mode != "mono_mixdown" and not is_stereo:
+        st.info("Input is not stereo; falling back to mono mixdown.")
+        channel_mode = "mono_mixdown"
 
-    scores = temporal_average(raw_scores, avg_frames)
+    outputs = {}
+    primary_key = None
 
-    if scores.shape[1] != len(labels):
-        raise ValueError(f"Mismatch: model outputs {scores.shape[1]} classes but labels has {len(labels)}.")
+    if channel_mode == "mono_mixdown":
+        mono = to_mono(x).astype(np.float32)
+        prog = st.progress(0.0, text="Running offline classification…")
+        t_centers, scores = classify_single_waveform(
+            interp,
+            mono,
+            sr,
+            sample_hz=float(sample_hz),
+            expected_len=expected_len,
+            avg_frames=int(avg_frames),
+            progress=prog,
+            progress_start=0.0,
+            progress_end=1.0,
+            progress_text="Running mono mixdown classification…",
+        )
+        prog.empty()
 
-    return t_centers, scores, labels
+        outputs["mono"] = {"t_sec": t_centers, "scores": scores}
+        primary_key = "mono"
+
+    elif channel_mode == "stereo_separate":
+        prog = st.progress(0.0, text="Running LEFT channel classification…")
+
+        t_left, s_left = classify_single_waveform(
+            interp,
+            channels["left"],
+            sr,
+            sample_hz=float(sample_hz),
+            expected_len=expected_len,
+            avg_frames=int(avg_frames),
+            progress=prog,
+            progress_start=0.0,
+            progress_end=0.5,
+            progress_text="Running LEFT channel classification…",
+        )
+
+        t_right, s_right = classify_single_waveform(
+            interp,
+            channels["right"],
+            sr,
+            sample_hz=float(sample_hz),
+            expected_len=expected_len,
+            avg_frames=int(avg_frames),
+            progress=prog,
+            progress_start=0.5,
+            progress_end=1.0,
+            progress_text="Running RIGHT channel classification…",
+        )
+        prog.empty()
+
+        if len(t_left) != len(t_right) or not np.allclose(t_left, t_right, atol=1e-4):
+            raise ValueError("Left/right channel frame grids do not align.")
+
+        outputs["left"] = {"t_sec": t_left, "scores": s_left}
+        outputs["right"] = {"t_sec": t_right, "scores": s_right}
+        primary_key = None
+
+    elif channel_mode == "stereo_average":
+        prog = st.progress(0.0, text="Running LEFT channel classification…")
+
+        t_left, s_left = classify_single_waveform(
+            interp,
+            channels["left"],
+            sr,
+            sample_hz=float(sample_hz),
+            expected_len=expected_len,
+            avg_frames=int(avg_frames),
+            progress=prog,
+            progress_start=0.0,
+            progress_end=0.5,
+            progress_text="Running LEFT channel classification…",
+        )
+
+        t_right, s_right = classify_single_waveform(
+            interp,
+            channels["right"],
+            sr,
+            sample_hz=float(sample_hz),
+            expected_len=expected_len,
+            avg_frames=int(avg_frames),
+            progress=prog,
+            progress_start=0.5,
+            progress_end=1.0,
+            progress_text="Running RIGHT channel classification…",
+        )
+        prog.empty()
+
+        if len(t_left) != len(t_right) or not np.allclose(t_left, t_right, atol=1e-4):
+            raise ValueError("Left/right channel frame grids do not align.")
+
+        s_avg = 0.5 * (s_left + s_right)
+
+        outputs["left"] = {"t_sec": t_left, "scores": s_left}
+        outputs["right"] = {"t_sec": t_right, "scores": s_right}
+        outputs["avg"] = {"t_sec": t_left, "scores": s_avg}
+        primary_key = "avg"
+
+    else:
+        raise ValueError(f"Unknown channel_mode={channel_mode}")
+
+    for name, out in outputs.items():
+        if out["scores"].shape[1] != len(labels):
+            raise ValueError(
+                f"Mismatch for {name}: model outputs {out['scores'].shape[1]} classes "
+                f"but labels has {len(labels)}."
+            )
+
+    return {
+        "requested_mode": channel_mode,
+        "effective_mode": channel_mode,
+        "labels": labels,
+        "outputs": outputs,
+        "primary_key": primary_key,
+    }
 
 
 def scores_to_long_df(t_centers: np.ndarray, scores: np.ndarray, labels: List[str], top_k: int) -> pd.DataFrame:
@@ -965,6 +1158,17 @@ if "_mode_epoch" not in st.session_state:
 if st.session_state["_last_mode"] != mode:
     st.session_state["_last_mode"] = mode
     st.session_state["_mode_epoch"] += 1
+
+st.sidebar.header("Channel handling")
+channel_mode = st.sidebar.selectbox(
+    "Stereo handling",
+    options=["stereo_separate", "stereo_average", "mono_mixdown"],
+    format_func=lambda x: {
+        "stereo_separate": "Stereo: LEFT/RIGHT separate",
+        "stereo_average": "Stereo: LEFT/RIGHT average",
+        "mono_mixdown": "Mono",
+    }[x],
+)
 
 st.sidebar.header("Model / labels")
 model_path = st.sidebar.text_input("Model path", value="yamnet.tflite")
@@ -1140,7 +1344,7 @@ if mode.startswith("1)"):
     run_btn = st.button("Run offline classification", type="primary")
     if run_btn:
         try:
-            t_centers, scores, labels_out = classify_audio_bytes(
+            result = classify_audio_bytes(
                 audio_bytes=audio_bytes,
                 audio_name=audio_up.name,
                 model_path=model_path,
@@ -1148,43 +1352,110 @@ if mode.startswith("1)"):
                 sample_hz=float(sample_hz),
                 window_s=float(window_s),
                 avg_frames=int(avg_frames),
+                channel_mode=channel_mode,
             )
-            df_long = scores_to_long_df(t_centers, scores, labels_out, top_k=int(top_k))
-            _strip_attrs_inplace(df_long)
-            st.session_state["offline_df"] = df_long
-            st.session_state["offline_full_t"] = t_centers
-            st.session_state["offline_full_scores"] = scores
-            st.session_state["offline_full_labels"] = labels_out
-
+            st.session_state["offline_result"] = result
         except Exception as e:
             st.exception(e)
             st.stop()
 
-    df_off = st.session_state.get("offline_df", pd.DataFrame())
-    if not df_off.empty:
-        stepper_view(df_off, "OFFLINE predictions", audio_bytes=audio_bytes, audio_name=audio_up.name)
+    offline_result = st.session_state.get("offline_result", None)
 
-        # download
-        out_bytes = df_long_to_jsonl_bytes(df_off)
-        st.download_button(
-            "Download offline predictions.jsonl",
-            data=out_bytes,
-            file_name="predictions.jsonl",
-            mime="application/jsonl",
-        )
+    if offline_result is not None:
+        mode_used = offline_result["effective_mode"]
 
-    t_full = st.session_state.get("offline_full_t", None)
-    s_full = st.session_state.get("offline_full_scores", None)
-    l_full = st.session_state.get("offline_full_labels", None)
+        if mode_used == "stereo_separate":
+            df_left = result_output_to_df(offline_result, "left", top_k=int(top_k))
+            df_right = result_output_to_df(offline_result, "right", top_k=int(top_k))
 
-    if t_full is not None and s_full is not None and l_full is not None:
-        #download the full 521-dim probability output
-        st.download_button(
-            "Download OFFLINE full vectors (.npz)",
-            data=npz_bytes_from_scores(t_full, s_full, l_full),
-            file_name="offline_full_vectors.npz",
-            mime="application/octet-stream",
-        )
+            side_by_side_view(
+                df_left,
+                df_right,
+                left_name="OFFLINE LEFT",
+                right_name="OFFLINE RIGHT",
+                audio_bytes=audio_bytes,
+                audio_name=audio_up.name,
+            )
+
+            c1, c2 = st.columns(2)
+
+            with c1:
+                st.download_button(
+                    "Download LEFT predictions.jsonl",
+                    data=df_long_to_jsonl_bytes(df_left),
+                    file_name="predictions_left.jsonl",
+                    mime="application/jsonl",
+                )
+                st.download_button(
+                    "Download LEFT full vectors (.npz)",
+                    data=npz_bytes_from_scores(
+                        offline_result["outputs"]["left"]["t_sec"],
+                        offline_result["outputs"]["left"]["scores"],
+                        offline_result["labels"],
+                    ),
+                    file_name="predictions_left_full.npz",
+                    mime="application/octet-stream",
+                )
+
+            with c2:
+                st.download_button(
+                    "Download RIGHT predictions.jsonl",
+                    data=df_long_to_jsonl_bytes(df_right),
+                    file_name="predictions_right.jsonl",
+                    mime="application/jsonl",
+                )
+                st.download_button(
+                    "Download RIGHT full vectors (.npz)",
+                    data=npz_bytes_from_scores(
+                        offline_result["outputs"]["right"]["t_sec"],
+                        offline_result["outputs"]["right"]["scores"],
+                        offline_result["labels"],
+                    ),
+                    file_name="predictions_right_full.npz",
+                    mime="application/octet-stream",
+                )
+        else:
+            primary_key = offline_result["primary_key"]
+            df_primary = result_output_to_df(offline_result, primary_key, top_k=int(top_k))
+
+            title = "OFFLINE predictions"
+            if primary_key == "avg":
+                title += " (averaged stereo output)"
+            elif primary_key == "mono":
+                title += " (mono mixdown)"
+
+            stepper_view(df_primary, title, audio_bytes=audio_bytes, audio_name=audio_up.name)
+
+            st.download_button(
+                f"Download {primary_key.upper()} predictions.jsonl",
+                data=df_long_to_jsonl_bytes(df_primary),
+                file_name=f"predictions_{primary_key}.jsonl",
+                mime="application/jsonl",
+            )
+
+            st.download_button(
+                f"Download {primary_key.upper()} full vectors (.npz)",
+                data=npz_bytes_from_scores(
+                    offline_result["outputs"][primary_key]["t_sec"],
+                    offline_result["outputs"][primary_key]["scores"],
+                    offline_result["labels"],
+                ),
+                file_name=f"predictions_{primary_key}_full.npz",
+                mime="application/octet-stream",
+            )
+
+            if mode_used == "stereo_average":
+                with st.expander("Inspect LEFT vs RIGHT channel predictions", expanded=False):
+                    df_left = result_output_to_df(offline_result, "left", top_k=int(top_k))
+                    df_right = result_output_to_df(offline_result, "right", top_k=int(top_k))
+                    side_by_side_view(
+                        df_left,
+                        df_right,
+                        left_name="OFFLINE LEFT",
+                        right_name="OFFLINE RIGHT",
+                        audio_bytes=None,
+                        audio_name="",
+                    )
 
 
 elif mode.startswith("2)"):
@@ -1267,7 +1538,7 @@ elif mode.startswith("3)"):
     run_btn = st.button("Run OFFLINE and compare", type="primary")
     if run_btn:
         try:
-            t_centers, scores, labels_out = classify_audio_bytes(
+            off_result = classify_audio_bytes(
                 audio_bytes=audio_bytes,
                 audio_name=audio_up.name,
                 model_path=model_path,
@@ -1275,69 +1546,92 @@ elif mode.startswith("3)"):
                 sample_hz=float(sample_hz),
                 window_s=float(window_s),
                 avg_frames=int(avg_frames),
+                channel_mode=channel_mode,
             )
-            df_off = scores_to_long_df(t_centers, scores, labels_out, top_k=int(top_k))
             _strip_attrs_inplace(df_rt)
-            _strip_attrs_inplace(df_off)
-            st.session_state["compare_off_df"] = df_off
+            st.session_state["compare_off_result"] = off_result
             st.session_state["compare_rt_df"] = df_rt
-            st.session_state["compare_off_full_scores"] = scores
-            st.session_state["compare_off_full_t"] = t_centers
         except Exception as e:
             st.exception(e)
             st.stop()
 
-    df_off = st.session_state.get("compare_off_df", pd.DataFrame())
+    off_result = st.session_state.get("compare_off_result", None)
     df_rt2 = st.session_state.get("compare_rt_df", pd.DataFrame())
 
-    if not df_off.empty and not df_rt2.empty:
-        # Full vector stats (optional)
-        def full_vector_stats(scores: np.ndarray) -> Tuple[np.ndarray, float]:
-            per_class_mean = scores.mean(axis=0)
-            return per_class_mean, float(per_class_mean.std())
+    if off_result is not None and not df_rt2.empty:
+        mode_used = off_result["effective_mode"]
 
-        rt_full = df_rt2.attrs.get("full_scores", None)
-        off_full = st.session_state.get("compare_off_full_scores", None)
+        def show_metrics_block(df_ref: pd.DataFrame, label: str):
+            st.markdown(f"### {label}")
+            m = compute_compare_metrics(df_rt2, df_ref, k=10)
+            if m:
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("Frames compared", m["frames_compared"])
+                c2.metric("Avg same in Top-10", f'{m["avg_same_in_topk"]:.2f}')
+                c3.metric("Top-1 match rate", f'{100*m["top1_match_rate"]:.1f}%')
+                c4.metric("Top-2 match rate", f'{100*m["top2_match_rate"]:.1f}%')
+                c5.metric("Avg |Δscore| (common)", f'{m["avg_abs_score_diff_on_common_labels"]:.3f}')
+                st.caption(f'Avg Jaccard(Top-10): {m["avg_jaccard_topk"]:.3f}')
+            sd_ref = compute_stddev_of_category_means(df_ref, k=10)
+            sd_rt = compute_stddev_of_category_means(df_rt2, k=10)
+            st.caption(f"Std dev of per-label mean scores (Top-10 approx) — RT: {sd_rt:.4f}, OFF: {sd_ref:.4f}")
 
-        if rt_full is not None and off_full is not None:
-            if rt_full.shape[1] == off_full.shape[1]:
-                rt_mean, rt_std = full_vector_stats(rt_full)
-                off_mean, off_std = full_vector_stats(off_full)
-                diff_std = float((rt_mean - off_mean).std())
-                st.caption(
-                    f"Full-521 stats — std(mean scores): RT={rt_std:.5f}, OFF={off_std:.5f}, "
-                    f"std(diff of means)={diff_std:.5f}"
-                )
-            else:
-                st.warning(
-                    f"Full-vector stats skipped: RT has {rt_full.shape[1]} classes but OFFLINE has {off_full.shape[1]}."
-                )
+        if mode_used == "stereo_separate":
+            df_left = result_output_to_df(off_result, "left", top_k=int(top_k))
+            df_right = result_output_to_df(off_result, "right", top_k=int(top_k))
 
-        # Summary metrics (always show)
-        st.subheader("Comparison summary metrics")
-        m = compute_compare_metrics(df_rt2, df_off, k=10)
-        if m:
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("Frames compared", m["frames_compared"])
-            c2.metric("Avg same in Top-10", f'{m["avg_same_in_topk"]:.2f}')
-            c3.metric("Top-1 match rate", f'{100*m["top1_match_rate"]:.1f}%')
-            c4.metric("Top-2 match rate", f'{100*m["top2_match_rate"]:.1f}%')
-            c5.metric("Avg |Δscore| (common)", f'{m["avg_abs_score_diff_on_common_labels"]:.3f}')
-            st.caption(f'Avg Jaccard(Top-10): {m["avg_jaccard_topk"]:.3f}')
+            show_metrics_block(df_left, "REAL-TIME vs OFFLINE LEFT")
+            show_metrics_block(df_right, "REAL-TIME vs OFFLINE RIGHT")
 
-        sd_rt = compute_stddev_of_category_means(df_rt2, k=10)
-        sd_off = compute_stddev_of_category_means(df_off, k=10)
-        st.caption(f"Std dev of per-label mean scores (Top-10 approx) — RT: {sd_rt:.4f}, OFF: {sd_off:.4f}")
+            inspect_channel = st.radio(
+                "Inspect which offline channel against real-time",
+                options=["left", "right"],
+                horizontal=True,
+            )
+            df_inspect = df_left if inspect_channel == "left" else df_right
 
-        side_by_side_view(df_rt2, df_off, left_name=f"REAL-TIME ({ann_up.name})", right_name="OFFLINE (this run)", audio_bytes=audio_bytes, audio_name=audio_up.name)
+            side_by_side_view(
+                df_rt2,
+                df_inspect,
+                left_name=f"REAL-TIME ({ann_up.name})",
+                right_name=f"OFFLINE {inspect_channel.upper()}",
+                audio_bytes=audio_bytes,
+                audio_name=audio_up.name,
+            )
 
-        out_bytes = df_long_to_jsonl_bytes(df_off)
-        st.download_button(
-            "Download OFFLINE predictions.jsonl (this run)",
-            data=out_bytes,
-            file_name="offline_predictions.jsonl",
-            mime="application/jsonl",
-        )
+        else:
+            primary_key = off_result["primary_key"]
+            df_off = result_output_to_df(off_result, primary_key, top_k=int(top_k))
+
+            label = "REAL-TIME vs OFFLINE"
+            if primary_key == "avg":
+                label += " (averaged stereo output)"
+            elif primary_key == "mono":
+                label += " (mono mixdown)"
+
+            show_metrics_block(df_off, label)
+
+            side_by_side_view(
+                df_rt2,
+                df_off,
+                left_name=f"REAL-TIME ({ann_up.name})",
+                right_name=f"OFFLINE {primary_key.upper()}",
+                audio_bytes=audio_bytes,
+                audio_name=audio_up.name,
+            )
+
+            if mode_used == "stereo_average":
+                with st.expander("Inspect LEFT vs RIGHT offline channels", expanded=False):
+                    df_left = result_output_to_df(off_result, "left", top_k=int(top_k))
+                    df_right = result_output_to_df(off_result, "right", top_k=int(top_k))
+                    side_by_side_view(
+                        df_left,
+                        df_right,
+                        left_name="OFFLINE LEFT",
+                        right_name="OFFLINE RIGHT",
+                        audio_bytes=None,
+                        audio_name="",
+                    )
 
     st.divider()
     with st.expander("Metric definitions", expanded=True):
