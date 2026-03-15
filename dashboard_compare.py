@@ -642,6 +642,93 @@ def compute_stddev_of_category_means(df_long: pd.DataFrame, k: int = 10) -> floa
     means = dfk.groupby("label")["score"].mean()
     return float(means.std()) if len(means) else float("nan")
 
+def compute_full_vector_pair_metrics(
+    t_a: np.ndarray,
+    scores_a: np.ndarray,
+    t_b: np.ndarray,
+    scores_b: np.ndarray,
+) -> dict:
+    """
+    Frame-aligned full-vector comparison metrics.
+    Requires matching frame grids.
+    """
+    if scores_a is None or scores_b is None:
+        return {}
+
+    if len(t_a) != len(t_b) or not np.allclose(t_a, t_b, atol=1e-4):
+        return {}
+
+    if scores_a.shape != scores_b.shape:
+        return {}
+
+    eps = 1e-8
+    dot = np.sum(scores_a * scores_b, axis=1)
+    norm_a = np.linalg.norm(scores_a, axis=1)
+    norm_b = np.linalg.norm(scores_b, axis=1)
+    cosine = dot / np.maximum(norm_a * norm_b, eps)
+
+    top1_a = np.argmax(scores_a, axis=1)
+    top1_b = np.argmax(scores_b, axis=1)
+
+    abs_diff = np.abs(scores_a - scores_b)
+    l2_diff = np.linalg.norm(scores_a - scores_b, axis=1)
+
+    return {
+        "mean_cosine_similarity_full": float(np.mean(cosine)),
+        "full_top1_match_rate": float(np.mean(top1_a == top1_b)),
+        "mean_abs_score_diff_full": float(np.mean(abs_diff)),
+        "mean_l2_score_diff_full": float(np.mean(l2_diff)),
+    }
+
+
+def compute_stereo_channel_metrics(result: dict, top_k_compare: int = 5) -> dict:
+    """
+    Compare LEFT vs RIGHT outputs inside a stereo result dict.
+    Uses:
+      - existing top-k set/rank metrics
+      - full 521-dim score metrics when available
+    """
+    outputs = result.get("outputs", {})
+    if "left" not in outputs or "right" not in outputs:
+        return {}
+
+    df_left = result_output_to_df(result, "left", top_k=int(top_k_compare))
+    df_right = result_output_to_df(result, "right", top_k=int(top_k_compare))
+
+    topk_metrics = compute_compare_metrics(df_left, df_right, k=int(top_k_compare))
+    topk_metrics["k_used"] = int(top_k_compare)
+
+    full_metrics = compute_full_vector_pair_metrics(
+        outputs["left"]["t_sec"],
+        outputs["left"]["scores"],
+        outputs["right"]["t_sec"],
+        outputs["right"]["scores"],
+    )
+
+    return {**topk_metrics, **full_metrics}
+
+
+def show_stereo_channel_metrics(result: dict, top_k_compare: int = 5, heading: str = "Stereo channel agreement (LEFT vs RIGHT)"):
+    m = compute_stereo_channel_metrics(result, top_k_compare=top_k_compare)
+    if not m:
+        return
+
+    st.subheader(heading)
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Frames compared", m.get("frames_compared", 0))
+    c2.metric(f"Top-1 match", f"{100 * m.get('top1_match_rate', 0.0):.1f}%")
+    c3.metric(f"Avg same in Top-{m['k_used']}", f"{m.get('avg_same_in_topk', 0.0):.2f}")
+    c4.metric(f"Avg Jaccard(Top-{m['k_used']})", f"{m.get('avg_jaccard_topk', 0.0):.3f}")
+    c5.metric("Mean cosine (full)", f"{m.get('mean_cosine_similarity_full', float('nan')):.3f}")
+    c6.metric("Mean |Δscore| (full)", f"{m.get('mean_abs_score_diff_full', float('nan')):.4f}")
+
+    st.caption(
+        f"Full-vector Top-1 match: {100 * m.get('full_top1_match_rate', 0.0):.1f}% • "
+        f"Mean L2 distance: {m.get('mean_l2_score_diff_full', float('nan')):.4f} • "
+        f"Avg |Δscore| on common Top-{m['k_used']} labels: "
+        f"{m.get('avg_abs_score_diff_on_common_labels', 0.0):.4f}"
+    )
 
 def nearest_frame_time(times: np.ndarray, t: float) -> float:
     """Return nearest time in sorted times array."""
@@ -867,6 +954,7 @@ def classify_audio_bytes(
         )
 
     channels = split_audio_channels(x)
+    requested_mode = channel_mode
     is_stereo = ("left" in channels and "right" in channels)
 
     if channel_mode != "mono_mixdown" and not is_stereo:
@@ -984,7 +1072,7 @@ def classify_audio_bytes(
             )
 
     return {
-        "requested_mode": channel_mode,
+        "requested_mode": requested_mode,
         "effective_mode": channel_mode,
         "labels": labels,
         "outputs": outputs,
@@ -1011,6 +1099,85 @@ def df_long_to_jsonl_bytes(df_long: pd.DataFrame) -> bytes:
         top = [{"label": row["label"], "score": float(row["score"])} for _, row in grp.iterrows()]
         out_lines.append(json.dumps({"t_sec": float(t), "top": top}))
     return ("\n".join(out_lines) + "\n").encode("utf-8")
+
+
+def plot_label_presence_over_time(
+    df_long: pd.DataFrame,
+    title: str,
+    min_score: float = 0.0,
+    max_labels: int = 25,
+    binary: bool = False,
+):
+    """
+    Heatmap over time:
+      x = time
+      y = label
+      z = score or binary presence
+    Uses only labels present in the saved top-k rows.
+    """
+    if df_long.empty:
+        st.info("No data available for timeline plot.")
+        return
+
+    plot_df = df_long.copy()
+    if min_score > 0:
+        plot_df = plot_df[plot_df["score"] >= float(min_score)].copy()
+
+    if plot_df.empty:
+        st.info("No labels remain after applying the confidence filter.")
+        return
+
+    summary = (
+        plot_df.groupby("label")
+        .agg(
+            frames_present=("t_sec", "nunique"),
+            mean_score=("score", "mean"),
+            max_score=("score", "max"),
+        )
+        .sort_values(["frames_present", "mean_score", "max_score"], ascending=False)
+    )
+
+    keep_labels = summary.head(int(max_labels)).index.tolist()
+    plot_df = plot_df[plot_df["label"].isin(keep_labels)].copy()
+
+    if binary:
+        plot_df["value"] = 1.0
+    else:
+        plot_df["value"] = plot_df["score"].astype(float)
+
+    mat = plot_df.pivot_table(
+        index="label",
+        columns="t_sec",
+        values="value",
+        aggfunc="max",
+        fill_value=0.0,
+    )
+
+    mat = mat.reindex(index=keep_labels)
+
+    try:
+        import plotly.graph_objects as go
+
+        fig = go.Figure(
+            data=go.Heatmap(
+                z=mat.to_numpy(),
+                x=mat.columns.astype(float),
+                y=mat.index.tolist(),
+                colorbar_title="Present" if binary else "Score",
+                zmin=0.0,
+                zmax=1.0 if binary else None,
+            )
+        )
+        fig.update_layout(
+            title=title,
+            xaxis_title="Time (s)",
+            yaxis_title="Audio category label",
+            height=max(350, 18 * len(mat.index) + 140),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    except Exception:
+        st.warning("Plotly heatmap unavailable. Install plotly to see the label timeline plot.")
+        st.dataframe(mat, use_container_width=True)
 
 # --- UI Helper Functs ---
 
@@ -1201,6 +1368,20 @@ rt_time_shift = st.sidebar.number_input(
     disabled=True
 )
 
+
+st.sidebar.header("Timeline plot")
+timeline_binary = st.sidebar.checkbox(
+    "Show binary presence instead of score",
+    value=False,
+)
+timeline_max_labels = st.sidebar.slider(
+    "Max labels in timeline plot",
+    min_value=5,
+    max_value=60,
+    value=25,
+    step=1,
+)
+
 st.sidebar.header("Display")
 min_conf = st.sidebar.slider("Min confidence (filter)", 0.0, 1.0, 0.0, 0.01)
 
@@ -1225,11 +1406,11 @@ def stepper_view(df_long: pd.DataFrame, title: str, audio_bytes: Optional[bytes]
         st.info("No rank=1 rows found in predictions.")
         return
 
-    top1_plot = top1[top1["score1"] >= min_conf].copy()
+    rendered_live_audio = False
 
     if audio_bytes is not None:
         if not HAS_FRAGMENT:
-            st.warning("Your Streamlit version doesn't support fragments; use the scrubber fallback.")
+            st.warning("Your Streamlit version doesn't support fragments; using slider fallback.")
         else:
             _live_one_fragment(
                 df_long=df_long,
@@ -1240,9 +1421,9 @@ def stepper_view(df_long: pd.DataFrame, title: str, audio_bytes: Optional[bytes]
                 poll_ms=poll_ms,
                 epoch=int(st.session_state["_mode_epoch"]),
             )
-            return
+            rendered_live_audio = True
 
-        # --- fallback slider (no audio) ---
+    if not rendered_live_audio:
         times = top1["t_sec"].to_numpy(dtype=float)
         tmin, tmax = float(times.min()), float(times.max())
         t_pick = st.slider("Scrub time (s)", tmin, tmax, tmin, key=f"scrub_fallback_{title}")
@@ -1251,13 +1432,14 @@ def stepper_view(df_long: pd.DataFrame, title: str, audio_bytes: Optional[bytes]
         st.write(f"Frame @ **{t_near:.3f}s** (nearest to scrub time)")
         st.table(frame)
 
-        try:
-            import plotly.express as px
-            fig = px.scatter(top1_plot, x="t_sec", y="top1", color="top1", hover_data=["score1"], height=450)
-            fig.update_layout(showlegend=False, xaxis_title="Time (s)", yaxis_title="Top-1 label")
-            st.plotly_chart(fig, use_container_width=True)
-        except Exception:
-            st.warning("Plotly not available; install 'plotly' for interactive plots.")
+    with st.expander("Label presence over time", expanded=True):
+        plot_label_presence_over_time(
+            df_long,
+            title=f"{title} — label timeline",
+            min_score=min_conf,
+            max_labels=timeline_max_labels,
+            binary=timeline_binary,
+        )
 
 
 def side_by_side_view(df_left, df_right, left_name, right_name, audio_bytes=None, audio_name=""):
@@ -1267,61 +1449,80 @@ def side_by_side_view(df_left, df_right, left_name, right_name, audio_bytes=None
         st.info("Need both datasets loaded.")
         return
 
-    #AUDIO MODE: only render the live fragment and EXIT
+    rendered_live_audio = False
+
     if audio_bytes is not None:
         if not HAS_FRAGMENT:
-            st.warning("Your Streamlit version doesn't support fragments; use the scrubber fallback.")
-            return
+            st.warning("Your Streamlit version doesn't support fragments; using slider fallback.")
+        else:
+            epoch = int(st.session_state.get("_mode_epoch", 0))
+            _cmp_live_fragment(
+                df_left=df_left,
+                df_right=df_right,
+                left_name=left_name,
+                right_name=right_name,
+                audio_bytes=audio_bytes,
+                audio_name=audio_name,
+                min_conf=min_conf,
+                poll_ms=int(poll_ms),
+                epoch=epoch,
+            )
+            rendered_live_audio = True
 
-        epoch = int(st.session_state.get("_mode_epoch", 0))
-        _cmp_live_fragment(
-            df_left=df_left,
-            df_right=df_right,
-            left_name=left_name,
-            right_name=right_name,
-            audio_bytes=audio_bytes,
-            audio_name=audio_name,
-            min_conf=min_conf,
-            poll_ms=int(poll_ms),
-            epoch=epoch,
+    if not rendered_live_audio:
+        top1_L = to_top1(df_left)
+        top1_R = to_top1(df_right)
+
+        times_L = top1_L["t_sec"].to_numpy(dtype=float)
+        times_R = top1_R["t_sec"].to_numpy(dtype=float)
+        tmin = float(min(times_L.min(), times_R.min()))
+        tmax = float(max(times_L.max(), times_R.max()))
+
+        t_pick = st.slider("Scrub time (s)", tmin, tmax, tmin, key=f"cmp_fallback_{left_name}_{right_name}")
+        tL = nearest_frame_time(times_L, float(t_pick))
+        tR = nearest_frame_time(times_R, float(t_pick))
+
+        rowL = top1_L[top1_L["t_sec"] == tL].iloc[0]
+        rowR = top1_R[top1_R["t_sec"] == tR].iloc[0]
+
+        st.markdown(
+            f"""
+            **Nearest frames**  
+            - {left_name}: **{tL:.3f}s** → **{rowL['top1']}** ({rowL['score1']:.3f})  
+            - {right_name}: **{tR:.3f}s** → **{rowR['top1']}** ({rowR['score1']:.3f})
+            """
         )
-        return
 
-    # --- non-audio fallback (slider-driven) ---
-    top1_L = to_top1(df_left)
-    top1_R = to_top1(df_right)
+        c1, c2 = st.columns(2, gap="large")
+        with c1:
+            frameL = df_left[df_left["t_sec"] == tL].sort_values("rank")
+            if min_conf > 0:
+                frameL = frameL[frameL["score"] >= min_conf]
+            st.dataframe(frameL, use_container_width=True, height=360)
+        with c2:
+            frameR = df_right[df_right["t_sec"] == tR].sort_values("rank")
+            if min_conf > 0:
+                frameR = frameR[frameR["score"] >= min_conf]
+            st.dataframe(frameR, use_container_width=True, height=360)
 
-    times_L = top1_L["t_sec"].to_numpy(dtype=float)
-    times_R = top1_R["t_sec"].to_numpy(dtype=float)
-    tmin = float(min(times_L.min(), times_R.min()))
-    tmax = float(max(times_L.max(), times_R.max()))
-
-    t_pick = st.slider("Scrub time (s)", tmin, tmax, tmin, key=f"cmp_fallback_{left_name}_{right_name}")
-    tL = nearest_frame_time(times_L, float(t_pick))
-    tR = nearest_frame_time(times_R, float(t_pick))
-
-    rowL = top1_L[top1_L["t_sec"] == tL].iloc[0]
-    rowR = top1_R[top1_R["t_sec"] == tR].iloc[0]
-
-    st.markdown(
-        f"""
-        **Nearest frames**  
-        - {left_name}: **{tL:.3f}s** → **{rowL['top1']}** ({rowL['score1']:.3f})  
-        - {right_name}: **{tR:.3f}s** → **{rowR['top1']}** ({rowR['score1']:.3f})
-        """
-    )
-
-    c1, c2 = st.columns(2, gap="large")
-    with c1:
-        frameL = df_left[df_left["t_sec"] == tL].sort_values("rank")
-        if min_conf > 0:
-            frameL = frameL[frameL["score"] >= min_conf]
-        st.dataframe(frameL, use_container_width=True, height=360)
-    with c2:
-        frameR = df_right[df_right["t_sec"] == tR].sort_values("rank")
-        if min_conf > 0:
-            frameR = frameR[frameR["score"] >= min_conf]
-        st.dataframe(frameR, use_container_width=True, height=360)
+    with st.expander("Label presence over time", expanded=False):
+        c1, c2 = st.columns(2, gap="large")
+        with c1:
+            plot_label_presence_over_time(
+                df_left,
+                title=f"{left_name} — label timeline",
+                min_score=min_conf,
+                max_labels=timeline_max_labels,
+                binary=timeline_binary,
+            )
+        with c2:
+            plot_label_presence_over_time(
+                df_right,
+                title=f"{right_name} — label timeline",
+                min_score=min_conf,
+                max_labels=timeline_max_labels,
+                binary=timeline_binary,
+            )
 
 # -----------------------------
 # Mode implementations
@@ -1363,6 +1564,13 @@ if mode.startswith("1)"):
 
     if offline_result is not None:
         mode_used = offline_result["effective_mode"]
+
+        if "left" in offline_result["outputs"] and "right" in offline_result["outputs"]:
+            show_stereo_channel_metrics(
+                offline_result,
+                top_k_compare=int(top_k),
+                heading="Stereo channel agreement (LEFT vs RIGHT)",
+            )
 
         if mode_used == "stereo_separate":
             df_left = result_output_to_df(offline_result, "left", top_k=int(top_k))
@@ -1560,10 +1768,18 @@ elif mode.startswith("3)"):
 
     if off_result is not None and not df_rt2.empty:
         mode_used = off_result["effective_mode"]
+        if "left" in off_result["outputs"] and "right" in off_result["outputs"]:
+            show_stereo_channel_metrics(
+                off_result,
+                top_k_compare=int(top_k),
+                heading="Stereo channel agreement inside OFFLINE output (LEFT vs RIGHT)",
+            )
 
         def show_metrics_block(df_ref: pd.DataFrame, label: str):
             st.markdown(f"### {label}")
-            m = compute_compare_metrics(df_rt2, df_ref, k=10)
+            k_compare = int(top_k)
+            m = compute_compare_metrics(df_rt2, df_ref, k=k_compare)
+            
             if m:
                 c1, c2, c3, c4, c5 = st.columns(5)
                 c1.metric("Frames compared", m["frames_compared"])
