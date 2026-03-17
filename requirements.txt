@@ -13,3 +13,4 @@ plotly>=5.18
 
 # For mp3/m4a decoding in dashboards (requires ffmpeg installed on the system)
 pydub>=0.25
+ffmpeg==1.4
