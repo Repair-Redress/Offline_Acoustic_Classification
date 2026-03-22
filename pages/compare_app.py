@@ -1,7 +1,7 @@
 import io
 import json
 import math
-from datetime import datetime, timedelta
+from datetime import datetime
 import re
 #from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -13,16 +13,13 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-import soundfile as sf
-import scipy.signal
-from pydub import AudioSegment
-
-try:
-    import tflite_runtime.interpreter as tflite
-    InterpreterCls = tflite.Interpreter
-except ImportError:
-    import tensorflow as tf
-    InterpreterCls = tf.lite.Interpreter
+def get_interpreter_cls():
+    try:
+        import tflite_runtime.interpreter as tflite
+        return tflite.Interpreter
+    except ImportError:
+        import tensorflow as tf
+        return tf.lite.Interpreter
 
 # -----------------------------
 # Utilities: labels + parsing
@@ -79,20 +76,6 @@ def apply_time_shift(df_long: pd.DataFrame, shift_sec: float) -> pd.DataFrame:
     out2 = out.sort_values(["t_sec", "rank"]).reset_index(drop=True)
     out2.attrs = dict(out.attrs)
     return out2
-
-
-def audio_clip_from_bytes(audio_bytes: bytes, filename: str, start_s: float, dur_s: float) -> bytes:
-    ext = (filename.split(".")[-1] or "").lower()
-    fmt = ext
-    if fmt == "m4a":
-        fmt = "mp4"
-    seg = AudioSegment.from_file(io.BytesIO(audio_bytes), format=fmt if fmt else None)
-    start_ms = max(0, int(start_s * 1000))
-    end_ms = min(len(seg), start_ms + int(dur_s * 1000))
-    clip = seg[start_ms:end_ms]
-    out = io.BytesIO()
-    clip.export(out, format="wav")
-    return out.getvalue()
 
 def _normalize_label(s: str) -> str:
     # normalize label names for matching (case/whitespace)
@@ -358,8 +341,10 @@ def read_audio_any_format(audio_bytes: bytes, filename: str) -> tuple[np.ndarray
     samples is float32, shape [n] or [n, channels]
     Tries soundfile first; falls back to pydub (ffmpeg) for mp3/m4a/etc.
     """
+    from pydub import AudioSegment
     # 1) Try soundfile (fast + accurate for wav/flac/ogg/aiff)
     try:
+        import soundfile as sf
         x, sr = sf.read(io.BytesIO(audio_bytes), always_2d=False)
         return np.asarray(x, dtype=np.float32), int(sr)
     except Exception:
@@ -390,6 +375,12 @@ def read_audio_any_format(audio_bytes: bytes, filename: str) -> tuple[np.ndarray
         x = arr.astype(np.float32)
 
     return x, int(sr)
+
+@st.cache_data(show_spinner=False)
+def read_audio_any_format_cached(audio_bytes: bytes, filename: str) -> tuple[np.ndarray, int]:
+    return read_audio_any_format(audio_bytes, filename)
+
+
 
 @st.cache_data
 def load_yamnet_labels_csv(path: str) -> List[str]:
@@ -518,29 +509,22 @@ def parse_predictions_csv_bytes(
         "(4) Android wide CSV with Capture time + label columns."
     )
 
+@st.cache_data(show_spinner=False)
+def parse_annotations_bytes(name: str, data: bytes, android_top_k: int, canonical_labels: tuple[str, ...]):
+    lower = name.lower()
+    canonical_labels = list(canonical_labels)
 
-def parse_annotations(uploaded, android_top_k: int = 5, canonical_labels: Optional[List[str]] = None) -> pd.DataFrame:
-    """Auto-detect .jsonl/.json/.csv into standard long-form df. Also supports Android wide CSV."""
-    b = uploaded.getvalue()
-    name = (uploaded.name or "").lower()
+    if lower.endswith(".jsonl"):
+        return parse_predictions_jsonl_bytes(data)
+    if lower.endswith(".json"):
+        return parse_predictions_json_bytes(data)
+    if lower.endswith(".csv"):
+        return parse_predictions_csv_bytes(data, android_top_k=android_top_k, canonical_labels=canonical_labels)
 
-    if name.endswith(".jsonl"):
-        return parse_predictions_jsonl_bytes(b)
-    if name.endswith(".json"):
-        return parse_predictions_json_bytes(b)
-    if name.endswith(".csv"):
-        return parse_predictions_csv_bytes(b, android_top_k=android_top_k, canonical_labels=canonical_labels)
-
-    # fallback: try jsonl then json
     try:
-        return parse_predictions_jsonl_bytes(b)
+        return parse_predictions_jsonl_bytes(data)
     except Exception:
-        try:
-            return parse_predictions_json_bytes(b)
-        except Exception as e:
-            raise ValueError(f"Unsupported annotations file: {uploaded.name}. Use .jsonl, .json, or .csv") from e
-
-
+        return parse_predictions_json_bytes(data)
 
 def to_top1(df_long: pd.DataFrame) -> pd.DataFrame:
     """Returns df with one row per frame: t_sec, top1, score1"""
@@ -554,17 +538,21 @@ def topk_at_time(df_long: pd.DataFrame, t: float, k: int) -> pd.DataFrame:
     frame = df_long[df_long["t_sec"] == t].sort_values("rank")
     return frame.head(k)
 
-def build_time_aligned_pairs(dfA: pd.DataFrame, dfB: pd.DataFrame) -> List[Tuple[float, float, float]]:
-    """
-    Returns list of (t_common, tA, tB) by iterating over A times and matching nearest in B.
-    """
-    tA = np.sort(dfA["t_sec"].unique().astype(float))
-    tB = np.sort(dfB["t_sec"].unique().astype(float))
-    pairs = []
-    for t in tA:
-        tB_near = nearest_frame_time(tB, float(t))
-        pairs.append((float(t), float(t), float(tB_near)))
-    return pairs
+def nearest_times_for_reference(ref_times: np.ndarray, candidate_times: np.ndarray) -> np.ndarray:
+    if len(ref_times) == 0 or len(candidate_times) == 0:
+        return np.array([], dtype=float)
+    
+    idx = np.searchsorted(candidate_times, ref_times)
+    idx = np.clip(idx, 0, len(candidate_times) - 1)
+
+    prev_idx = np.clip(idx - 1, 0, len(candidate_times) - 1)
+    next_idx = idx
+
+    prev_vals = candidate_times[prev_idx]
+    next_vals = candidate_times[next_idx]
+
+    choose_prev = np.abs(ref_times - prev_vals) <= np.abs(ref_times - next_vals)
+    return np.where(choose_prev, prev_vals, next_vals)
 
 def compute_compare_metrics(df_rt: pd.DataFrame, df_off: pd.DataFrame, k: int = 10) -> dict:
     """
@@ -572,8 +560,11 @@ def compute_compare_metrics(df_rt: pd.DataFrame, df_off: pd.DataFrame, k: int = 
     """
     if df_rt.empty or df_off.empty:
         return {}
-
-    pairs = build_time_aligned_pairs(df_rt, df_off)
+    
+    rt_times = np.sort(df_rt["t_sec"].unique().astype(float))
+    off_times = np.sort(df_off["t_sec"].unique().astype(float))
+    matched_off_times = nearest_times_for_reference(rt_times, off_times)
+    pairs = list(zip(rt_times, matched_off_times))
 
     same_top1 = 0
     same_top2 = 0
@@ -585,7 +576,7 @@ def compute_compare_metrics(df_rt: pd.DataFrame, df_off: pd.DataFrame, k: int = 
     rt_groups = {t: g.sort_values("rank") for t, g in df_rt.groupby("t_sec")}
     off_groups = {t: g.sort_values("rank") for t, g in df_off.groupby("t_sec")}
 
-    for _, tR, tO in pairs:
+    for tR, tO in pairs:
         gR = rt_groups.get(tR)
         gO = off_groups.get(tO)
         if gR is None or gO is None:
@@ -835,6 +826,7 @@ def result_output_to_df(result: dict, output_key: str, top_k: int) -> pd.DataFra
     return df
 
 def resample(x: np.ndarray, sr_in: int, sr_out: int = 16000) -> np.ndarray:
+    import scipy.signal
     if sr_in == sr_out:
         return x.astype(np.float32)
     g = math.gcd(sr_in, sr_out)
@@ -878,6 +870,7 @@ def temporal_average(scores: np.ndarray, avg_frames: int) -> np.ndarray:
 
 @st.cache_resource
 def load_interpreter(model_path: str):
+    InterpreterCls = get_interpreter_cls()
     interp = InterpreterCls(model_path=model_path)
     interp.allocate_tensors()
     return interp
@@ -939,7 +932,7 @@ def classify_audio_bytes(
     }
     """
 
-    x, sr = read_audio_any_format(audio_bytes, filename=audio_name)
+    x, sr = read_audio_any_format_cached(audio_bytes, filename=audio_name)
     x = np.asarray(x)
 
     interp = load_interpreter(model_path)
@@ -1081,12 +1074,26 @@ def classify_audio_bytes(
 
 
 def scores_to_long_df(t_centers: np.ndarray, scores: np.ndarray, labels: List[str], top_k: int) -> pd.DataFrame:
-    rows = []
-    for t, s in zip(t_centers, scores):
-        idx = np.argsort(-s)[:top_k]
-        for r, i in enumerate(idx, start=1):
-            rows.append({"t_sec": float(t), "rank": r, "label": labels[int(i)], "score": float(s[int(i)])})
-    return pd.DataFrame(rows).sort_values(["t_sec", "rank"]).reset_index(drop=True)
+    if len(t_centers) == 0 or scores.size == 0:
+        return pd.DataFrame(columns=["t_sec", "rank", "label", "score"])
+
+    top_k = min(int(top_k), scores.shape[1])
+
+    idx = np.argpartition(-scores, kth=top_k - 1, axis=1)[:, :top_k]
+    top_scores = np.take_along_axis(scores, idx, axis=1)
+
+    order = np.argsort(-top_scores, axis=1)
+    idx = np.take_along_axis(idx, order, axis=1)
+    top_scores = np.take_along_axis(top_scores, order, axis=1)
+
+    n_frames = len(t_centers)
+    out = pd.DataFrame({
+        "t_sec": np.repeat(t_centers.astype(float), top_k),
+        "rank": np.tile(np.arange(1, top_k + 1), n_frames),
+        "label": np.array(labels, dtype=object)[idx.reshape(-1)],
+        "score": top_scores.reshape(-1).astype(float),
+    })
+    return out
 
 
 def df_long_to_jsonl_bytes(df_long: pd.DataFrame) -> bytes:
@@ -1265,10 +1272,6 @@ def _cmp_live_fragment(
         frameR = _small_frame_for_display(df_right, tR, min_conf)
         st.table(frameR)
 
-
-def _safe_key(s: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9_]+", "_", s)
-
 def _live_one_fragment(
     df_long: pd.DataFrame,
     title: str,
@@ -1300,6 +1303,26 @@ def _live_one_fragment(
     st.write(f"Frame @ **{t_near:.3f}s** (nearest to playback)")
     st.table(frame)
 
+def load_annotation_df(uploaded, top_k: int, labels: List[str]):
+    data = uploaded.getvalue()
+    name = uploaded.name
+
+    if name.lower().endswith(".npz"):
+        df, t_full, scores_full, labels_full = parse_predictions_npz_bytes(data, top_k=top_k)
+        return df, {
+            "full_t_sec": t_full,
+            "full_scores": scores_full,
+            "full_labels": labels_full,
+        }
+
+    df = parse_annotations_bytes(
+        name=name,
+        data=data,
+        android_top_k=top_k,
+        canonical_labels=tuple(labels),
+    )
+    return df, {}
+
 # -----------------------------
 # Streamlit UI
 # -----------------------------
@@ -1307,14 +1330,16 @@ def _live_one_fragment(
 st.set_page_config(page_title="Offline vs Real-time AudioSet (YAMNet) Viewer", layout="wide")
 st.title("Offline vs Real-time AudioSet (YAMNet) Dashboard")
 
+st.caption("See the Help page for metric definitions, parameter explanations, and AudioSet/YAMNet notes.")
+
 st.sidebar.header("Mode")
 mode = st.sidebar.radio(
     "Choose a workflow",
     [
-        "1) Upload audio → run OFFLINE classification → step through",
-        "2) Upload annotations → step through",
-        "3) Upload audio + REAL-TIME annotations → run OFFLINE + compare side-by-side",
-    ],
+        "Offline from audio",
+        "View annotations",
+        "Compare RT vs offline",
+    ]
 )
 
 if "_last_mode" not in st.session_state:
@@ -1337,9 +1362,28 @@ channel_mode = st.sidebar.selectbox(
     }[x],
 )
 
-st.sidebar.header("Model / labels")
-model_path = st.sidebar.text_input("Model path", value="yamnet.tflite")
-labels_path = st.sidebar.text_input("Label map path", value="yamnet_class_map.csv")
+st.sidebar.header("Audio Playback Settings")
+poll_ms = st.sidebar.slider("Playback sync rate (ms)", 100, 2000, 1000, 50)
+
+model_path = "yamnet.tflite"
+labels_path = "yamnet_class_map.csv"
+sample_hz = 1.0
+window_s = 0.975
+avg_frames = 1
+top_k = 5
+labels = []
+
+st.sidebar.header("Other Settings/Information")
+with st.sidebar.expander("Advanced model settings", expanded=False):
+    st.markdown("**Model / labels**")
+    model_path = st.text_input("Model path", value="yamnet.tflite")
+    labels_path = st.text_input("Label map path", value="yamnet_class_map.csv")
+
+    st.markdown("**Offline params**")
+    st.caption("sample_hz: 1.0")
+    st.caption("window_s: 0.975")
+    st.caption("avg_frames: 1")
+    st.caption("top_k: 5")
 
 # Load labels once
 try:
@@ -1348,50 +1392,37 @@ except Exception as e:
     st.sidebar.error(f"Could not load labels from {labels_path}: {e}")
     labels = []
 
-st.sidebar.header("Offline params")
-sample_hz = st.sidebar.number_input("sample_hz (predictions / sec)", min_value=0.1, max_value=20.0, value=1.0, step=0.1, disabled=True)
-window_s = st.sidebar.number_input("window_s (seconds)", min_value=0.1, max_value=5.0, value=0.975, step=0.025, disabled=True)
-avg_frames = st.sidebar.number_input("avg_frames (smoothing)", min_value=1, max_value=50, value=1, step=1, disabled=True)
-top_k = st.sidebar.number_input("top_k (saved per frame)", min_value=1, max_value=30, value=5, step=1, disabled=True)
-
-st.sidebar.header("Audio scrubber (recommended)")
-use_scrubber = st.sidebar.checkbox("Use scrubber slider to drive labels + playback", value=True)
-scrub_clip_s = st.sidebar.number_input("Scrub clip length (sec)", min_value=0.5, max_value=10.0, value=2.0, step=0.5, disabled=True)
-
-poll_ms = st.sidebar.slider("Playback sync rate (ms)", 100, 2000, 1000, 50)
-
-st.sidebar.header("Real-time alignment")
-rt_time_shift = st.sidebar.number_input(
-    "Real-time time shift (sec) applied to uploaded RT annotations",
-    value=-0.975/2,  # default: capture time is END of window -> subtract half window
-    step=0.01,
-    disabled=True
-)
+with st.sidebar.expander("Timeline settings", expanded=False):
+    st.markdown("**Timeline plot**")
+    timeline_binary = st.checkbox(
+        "Show binary presence instead of score",
+        value=False,
+    )
+    timeline_max_labels = st.slider(
+        "Max labels in timeline plot",
+        min_value=5,
+        max_value=60,
+        value=25,
+        step=1,
+    )
+    st.markdown("**Display**")
+    min_conf = st.slider("Min confidence (filter)", 0.0, 1.0, 0.0, 0.01)
 
 
-st.sidebar.header("Timeline plot")
-timeline_binary = st.sidebar.checkbox(
-    "Show binary presence instead of score",
-    value=False,
-)
-timeline_max_labels = st.sidebar.slider(
-    "Max labels in timeline plot",
-    min_value=5,
-    max_value=60,
-    value=25,
-    step=1,
-)
+with st.sidebar.expander("Comparison settings", expanded=False):
+    st.markdown("**Real-time alignment**")
+    rt_time_shift = st.number_input(
+        "Real-time time shift (sec) applied to uploaded RT annotations",
+        value=-0.975/2,  # default: capture time is END of window -> subtract half window
+        step=0.01,
+        disabled=True
+    )
 
-st.sidebar.header("Display")
-min_conf = st.sidebar.slider("Min confidence (filter)", 0.0, 1.0, 0.0, 0.01)
-
-HAS_FRAGMENT = hasattr(st, "fragment")
-if HAS_FRAGMENT:
-    _cmp_live_fragment = st.fragment(_cmp_live_fragment)
 
 # --- Wrap as fragments (recompute wrapping when poll_ms changes) ---
 HAS_FRAGMENT = hasattr(st, "fragment")
 if HAS_FRAGMENT:
+    _cmp_live_fragment = st.fragment(_cmp_live_fragment)
     _live_one_fragment = st.fragment(_live_one_fragment)
 
 def stepper_view(df_long: pd.DataFrame, title: str, audio_bytes: Optional[bytes] = None, audio_name: str = ""):
@@ -1432,7 +1463,7 @@ def stepper_view(df_long: pd.DataFrame, title: str, audio_bytes: Optional[bytes]
         st.write(f"Frame @ **{t_near:.3f}s** (nearest to scrub time)")
         st.table(frame)
 
-    with st.expander("Label presence over time", expanded=True):
+    with st.expander("Label presence over time", expanded=False):
         plot_label_presence_over_time(
             df_long,
             title=f"{title} — label timeline",
@@ -1495,15 +1526,11 @@ def side_by_side_view(df_left, df_right, left_name, right_name, audio_bytes=None
 
         c1, c2 = st.columns(2, gap="large")
         with c1:
-            frameL = df_left[df_left["t_sec"] == tL].sort_values("rank")
-            if min_conf > 0:
-                frameL = frameL[frameL["score"] >= min_conf]
-            st.dataframe(frameL, use_container_width=True, height=360)
+            frameL = _small_frame_for_display(df_left, tL, min_conf)
+            st.table(frameL)
         with c2:
-            frameR = df_right[df_right["t_sec"] == tR].sort_values("rank")
-            if min_conf > 0:
-                frameR = frameR[frameR["score"] >= min_conf]
-            st.dataframe(frameR, use_container_width=True, height=360)
+            frameR = _small_frame_for_display(df_right, tR, min_conf)
+            st.table(frameR)
 
     with st.expander("Label presence over time", expanded=False):
         c1, c2 = st.columns(2, gap="large")
@@ -1528,7 +1555,7 @@ def side_by_side_view(df_left, df_right, left_name, right_name, audio_bytes=None
 # Mode implementations
 # -----------------------------
 
-if mode.startswith("1)"):
+if mode == "Offline from audio":
     st.write("Upload an audio file, run offline YAMNet classification, then step through predictions.")
 
     audio_up = st.file_uploader("Upload audio (WAV recommended)", type=["wav", "flac", "ogg", "aiff", "aif", "aifc", "mp3", "m4a", "mp4"])
@@ -1537,6 +1564,10 @@ if mode.startswith("1)"):
         st.stop()
 
     audio_bytes = audio_up.getvalue()
+    current_audio_hash = hashlib.md5(audio_bytes).hexdigest()
+    if st.session_state.get("offline_audio_hash") != current_audio_hash:
+        st.session_state.pop("offline_result", None)
+        st.session_state["offline_audio_hash"] = current_audio_hash
 
     if not labels:
         st.error("Label map not loaded. Fix label map path in the sidebar.")
@@ -1666,7 +1697,7 @@ if mode.startswith("1)"):
                     )
 
 
-elif mode.startswith("2)"):
+elif mode == "View annotations":
     st.write("Upload an annotations file (JSONL/JSON/CSV) and step through predictions.")
     ann_up = st.file_uploader("Upload annotations file", type=["jsonl", "json", "csv", "npz"])
     audio_up = st.file_uploader("(Optional) Upload audio for playback", type=["wav", "flac", "ogg", "aiff", "aif", "aifc", "mp3", "m4a", "mp4"])
@@ -1678,22 +1709,13 @@ elif mode.startswith("2)"):
         st.stop()
 
     try:
-        if ann_up.name.lower().endswith(".npz"):
-            df_ann, t_full, scores_full, labels_full = parse_predictions_npz_bytes(ann_up.getvalue(), top_k=int(top_k))
-            _strip_attrs_inplace(df_ann)
-            st.session_state["ann_full_scores"] = scores_full
-            st.session_state["ann_full_t"] = t_full
-            st.session_state["ann_full_labels"] = labels_full
-        else:
-            df_ann = parse_annotations(ann_up, android_top_k=int(top_k), canonical_labels=labels)
-            st.session_state.pop("ann_full_scores", None)
-            st.session_state.pop("ann_full_t", None)
-            st.session_state.pop("ann_full_labels", None)
+        df_ann, extras = load_annotation_df(ann_up, int(top_k), labels)
+        for k, v in extras.items():
+            df_ann.attrs[k] = v
         default_shift = (df_ann.attrs.get("schema") == "android_wide_converted")
         apply_shift = st.checkbox("Apply time shift to this annotation file", value=default_shift)
         if apply_shift:
             df_ann = apply_time_shift(df_ann, shift_sec=float(rt_time_shift))
-
     except Exception as e:
         st.exception(e)
         st.stop()
@@ -1710,7 +1732,7 @@ elif mode.startswith("2)"):
     _strip_attrs_inplace(df_ann)
     stepper_view(df_ann, f"Annotations: {ann_up.name}", audio_bytes=audio_bytes, audio_name=(audio_up.name if audio_up else ""))
 
-elif mode.startswith("3)"):
+elif mode == "Compare RT vs offline":
     st.write("Upload audio + real-time annotations, run offline classification, then compare side-by-side.")
 
     audio_up = st.file_uploader("Upload audio (WAV recommended)", type=["wav", "flac", "ogg", "aiff", "aif", "aifc", "mp3", "m4a", "mp4"])
@@ -1721,26 +1743,25 @@ elif mode.startswith("3)"):
         st.stop()
 
     audio_bytes = audio_up.getvalue()
+    current_compare_key = hashlib.md5(audio_bytes + ann_up.getvalue()).hexdigest()
+    if st.session_state.get("compare_input_hash") != current_compare_key:
+        st.session_state.pop("compare_off_result", None)
+        st.session_state.pop("compare_rt_df", None)
+        st.session_state["compare_input_hash"] = current_compare_key
 
     # Parse real-time annotations
     try:
-        if ann_up.name.lower().endswith(".npz"):
-            df_rt, t_full, scores_full, labels_full = parse_predictions_npz_bytes(ann_up.getvalue(), top_k=int(top_k))
-            df_rt.attrs["full_scores"] = scores_full
-            df_rt.attrs["full_t_sec"] = t_full
-            df_rt.attrs["full_labels"] = labels_full
-        else:
-            df_rt = parse_annotations(ann_up, android_top_k=int(top_k), canonical_labels=labels)
-            st.session_state.pop("ann_full_scores", None)
-            st.session_state.pop("ann_full_t", None)
-            st.session_state.pop("ann_full_labels", None)
+        df_rt, extras = load_annotation_df(ann_up, int(top_k), labels)
+        for k, v in extras.items():
+            df_rt.attrs[k] = v
+        
         df_rt = apply_time_shift(df_rt, shift_sec=float(rt_time_shift))
     except Exception as e:
         st.exception(e)
         st.stop()
 
     if not labels:
-        st.error("Label map not loaded. Fix label map path in the sidebar.")
+        st.sidebar.error("Label map not loaded. Fix label map path in the sidebar.")
         st.stop()
 
     run_btn = st.button("Run OFFLINE and compare", type="primary")
@@ -1766,14 +1787,11 @@ elif mode.startswith("3)"):
     off_result = st.session_state.get("compare_off_result", None)
     df_rt2 = st.session_state.get("compare_rt_df", pd.DataFrame())
 
+
     if off_result is not None and not df_rt2.empty:
         mode_used = off_result["effective_mode"]
-        if "left" in off_result["outputs"] and "right" in off_result["outputs"]:
-            show_stereo_channel_metrics(
-                off_result,
-                top_k_compare=int(top_k),
-                heading="Stereo channel agreement inside OFFLINE output (LEFT vs RIGHT)",
-            )
+
+        tab1, tab2 = st.tabs(["Compare", "Metrics"])
 
         def show_metrics_block(df_ref: pd.DataFrame, label: str):
             st.markdown(f"### {label}")
@@ -1783,38 +1801,21 @@ elif mode.startswith("3)"):
             if m:
                 c1, c2, c3, c4, c5 = st.columns(5)
                 c1.metric("Frames compared", m["frames_compared"])
-                c2.metric("Avg same in Top-10", f'{m["avg_same_in_topk"]:.2f}')
+                c2.metric(f"Avg same in Top-{k_compare}", f'{m["avg_same_in_topk"]:.2f}')
                 c3.metric("Top-1 match rate", f'{100*m["top1_match_rate"]:.1f}%')
                 c4.metric("Top-2 match rate", f'{100*m["top2_match_rate"]:.1f}%')
                 c5.metric("Avg |Δscore| (common)", f'{m["avg_abs_score_diff_on_common_labels"]:.3f}')
-                st.caption(f'Avg Jaccard(Top-10): {m["avg_jaccard_topk"]:.3f}')
-            sd_ref = compute_stddev_of_category_means(df_ref, k=10)
-            sd_rt = compute_stddev_of_category_means(df_rt2, k=10)
-            st.caption(f"Std dev of per-label mean scores (Top-10 approx) — RT: {sd_rt:.4f}, OFF: {sd_ref:.4f}")
-
+                st.caption(f'Avg Jaccard(Top-{k_compare}): {m["avg_jaccard_topk"]:.3f}')
+            sd_ref = compute_stddev_of_category_means(df_ref, k=k_compare)
+            sd_rt = compute_stddev_of_category_means(df_rt2, k=k_compare)
+            st.caption(
+                f"Std dev of per-label mean scores (Top-{k_compare} approx) — "
+                f"RT: {sd_rt:.4f}, OFF: {sd_ref:.4f}"
+            )
+        
         if mode_used == "stereo_separate":
             df_left = result_output_to_df(off_result, "left", top_k=int(top_k))
             df_right = result_output_to_df(off_result, "right", top_k=int(top_k))
-
-            show_metrics_block(df_left, "REAL-TIME vs OFFLINE LEFT")
-            show_metrics_block(df_right, "REAL-TIME vs OFFLINE RIGHT")
-
-            inspect_channel = st.radio(
-                "Inspect which offline channel against real-time",
-                options=["left", "right"],
-                horizontal=True,
-            )
-            df_inspect = df_left if inspect_channel == "left" else df_right
-
-            side_by_side_view(
-                df_rt2,
-                df_inspect,
-                left_name=f"REAL-TIME ({ann_up.name})",
-                right_name=f"OFFLINE {inspect_channel.upper()}",
-                audio_bytes=audio_bytes,
-                audio_name=audio_up.name,
-            )
-
         else:
             primary_key = off_result["primary_key"]
             df_off = result_output_to_df(off_result, primary_key, top_k=int(top_k))
@@ -1825,77 +1826,55 @@ elif mode.startswith("3)"):
             elif primary_key == "mono":
                 label += " (mono mixdown)"
 
-            show_metrics_block(df_off, label)
+        with tab1: #Compare
+            if mode_used == "stereo_separate":
+                inspect_channel = st.radio(
+                    "Select offline channel to compare to real-time:",
+                    options=["left", "right"],
+                    horizontal=False,
+                )
+                df_inspect = df_left if inspect_channel == "left" else df_right
 
-            side_by_side_view(
-                df_rt2,
-                df_off,
-                left_name=f"REAL-TIME ({ann_up.name})",
-                right_name=f"OFFLINE {primary_key.upper()}",
-                audio_bytes=audio_bytes,
-                audio_name=audio_up.name,
-            )
+                side_by_side_view(
+                    df_rt2,
+                    df_inspect,
+                    left_name=f"REAL-TIME ({ann_up.name})",
+                    right_name=f"OFFLINE {inspect_channel.upper()}",
+                    audio_bytes=audio_bytes,
+                    audio_name=audio_up.name,
+                )
+            else:
+                side_by_side_view(
+                    df_rt2,
+                    df_off,
+                    left_name=f"REAL-TIME ({ann_up.name})",
+                    right_name=f"OFFLINE {primary_key.upper()}",
+                    audio_bytes=audio_bytes,
+                    audio_name=audio_up.name,
+                )
 
-            if mode_used == "stereo_average":
-                with st.expander("Inspect LEFT vs RIGHT offline channels", expanded=False):
-                    df_left = result_output_to_df(off_result, "left", top_k=int(top_k))
-                    df_right = result_output_to_df(off_result, "right", top_k=int(top_k))
-                    side_by_side_view(
-                        df_left,
-                        df_right,
-                        left_name="OFFLINE LEFT",
-                        right_name="OFFLINE RIGHT",
-                        audio_bytes=None,
-                        audio_name="",
+                if mode_used == "stereo_average":
+                    with st.expander("Inspect LEFT vs RIGHT offline channels", expanded=False):
+                        df_left = result_output_to_df(off_result, "left", top_k=int(top_k))
+                        df_right = result_output_to_df(off_result, "right", top_k=int(top_k))
+                        side_by_side_view(
+                            df_left,
+                            df_right,
+                            left_name="OFFLINE LEFT",
+                            right_name="OFFLINE RIGHT",
+                            audio_bytes=None,
+                            audio_name="",
+                        )
+        with tab2: #Metrics
+            if mode_used == "stereo_separate":
+                if "left" in off_result["outputs"] and "right" in off_result["outputs"]:
+                    show_stereo_channel_metrics(
+                        off_result,
+                        top_k_compare=int(top_k),
+                        heading="Stereo channel agreement inside OFFLINE output (LEFT vs RIGHT)",
                     )
-
-    st.divider()
-    with st.expander("Metric definitions", expanded=True):
-
-        with st.expander("Frames compared", expanded=False):
-            st.write(
-                "How many frame-to-frame comparisons were made. "
-                "This equals the number of unique frame times in the real-time dataset, "
-                "because the code iterates over RT frames and matches each one to the nearest OFFLINE frame."
-            )
-
-        with st.expander("Avg same in Top-10", expanded=False):
-            st.write(
-                "For each matched pair of frames, take the Top-10 label sets from RT and OFFLINE and count "
-                "how many labels overlap. This metric is the average overlap count across all compared frames "
-                "(range: 0 to 10)."
-            )
-
-        with st.expander("Top-1 match rate", expanded=False):
-            st.write(
-                "The fraction of matched frames where the highest-scoring (rank=1) label is exactly the same "
-                "between RT and OFFLINE. Reported as a percentage."
-            )
-
-        with st.expander("Top-2 match rate", expanded=False):
-            st.write(
-                "The fraction of matched frames where the second-highest (rank=2) label is exactly the same "
-                "between RT and OFFLINE. Reported as a percentage."
-            )
-
-        with st.expander("Avg Jaccard(Top-10)", expanded=False):
-            st.write(
-                "For each matched pair of frames, compute the Jaccard similarity between the two Top-10 label sets."
-            )
-            st.latex(r"J = \frac{|A \cap B|}{|A \cup B|}")
-            st.write("Then average across frames. Range: 0 to 1 (higher means more similar sets).")
-
-        with st.expander("Avg |Δscore| (common)", expanded=False):
-            st.write(
-                "For each matched pair of frames, look only at labels that appear in both Top-10 sets. "
-                "For those common labels, compute the absolute score difference |s_RT - s_OFF|, average within "
-                "the frame, then average across frames. Lower means better agreement on shared labels’ confidence scores."
-            )
-
-        with st.expander("Std dev of per-label mean scores (Top-10 approx)", expanded=False):
-            st.write(
-                "For each label, compute its mean score only over frames where it appears in the Top-10 "
-                "(this is an approximation since we’re not using full 521-dim vectors here). Then compute the "
-                "standard deviation across labels. Higher values mean the model concentrates probability mass more unevenly "
-                "across labels; lower values mean label scores are more uniformly distributed (within the Top-10 approximation)."
-            )
+                show_metrics_block(df_left, "REAL-TIME vs OFFLINE LEFT")
+                show_metrics_block(df_right, "REAL-TIME vs OFFLINE RIGHT")
+            else:
+                show_metrics_block(df_off, label)
+        

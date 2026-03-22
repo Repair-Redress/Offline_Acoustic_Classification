@@ -1,32 +1,37 @@
 # Offline AudioSet (YAMNet) Classification + Visualization
 
-This directory supports **offline audio event classification** using **YAMNet (AudioSet / 521 classes)** and provides lightweight **Streamlit dashboards** for stepping through predictions, visualizing category activity over time, and comparing uploaded annotation outputs against offline inference.
+This directory supports **offline audio event classification** using **YAMNet (AudioSet / 521 classes)** and provides several **Streamlit apps** for exploring saved results, stepping through predictions, and comparing uploaded annotation outputs against offline inference.
+
+The app suite now uses a **multipage Streamlit navigation setup** with a root entrypoint (`dashboard_app.py`) and page files under `pages/`, so page titles in the sidebar can be controlled without renaming the underlying Python files.
 
 ---
 
 ## What’s in this folder
 
-- `offlineclassify.py` — CLI tool: audio file → `predictions.jsonl` / `predictions_full.npz`
-- `viz_app.py` — Streamlit dashboard to explore classification results
-- `dashboard_compare.py` — Streamlit dashboard to:
+- `dashboard_app.py` — **main Streamlit entrypoint** using Streamlit's navigation API
+- `pages/compare_app.py` — comparison dashboard page to:
   - run offline inference on uploaded audio
   - inspect uploaded annotation files
   - compare uploaded annotations against offline inference
   - handle stereo audio in multiple modes
+- `pages/help_app.py` — help/reference page for:
+  - metric definitions
+  - parameter descriptions
+  - model / ontology notes
+  - supported input formats
+- `pages/viz_app.py` — visualization page for exploring classification results
+- `offlineclassify.py` — CLI tool: audio file → `predictions.jsonl` / `predictions_full.npz`
 - `yamnet.tflite` — YAMNet TensorFlow Lite model
 - `yamnet_class_map.csv` — Label map (521 AudioSet classes for YAMNet)
-- `predictions.jsonl` — Example/output top-k predictions file
-- `predictions_full.npz` — Optional full-vector output (`t_sec`, `scores`, `labels`)
-- `Recording.wav` — Example audio file
 - `requirements.txt` — Python dependencies
-- `label_extractor.py` — Optional helper for extracting labels from TFLite metadata
-- `metadata.json` — Optional project metadata / documentation
+- `label_extractor.py` — optional helper for extracting labels from TFLite metadata
+- `metadata.json` — optional project metadata / documentation
 
 ---
 
 ## Setup
 
-### 1) Create an environment (recommended)
+### 1) Create an environment
 
 Using conda:
 
@@ -36,21 +41,22 @@ conda activate yamnet_offline
 pip install -r requirements.txt
 ~~~
 
-**macOS note:** if `soundfile` fails to install, install `libsndfile` first:
+### macOS notes
+
+If `soundfile` fails to install:
 
 ~~~bash
 brew install libsndfile
 pip install soundfile
 ~~~
 
-**macOS note:** `ffmpeg` may be required to process `m4a`, `mp3`, and `mp4` audio files:
+If you want support for `mp3`, `m4a`, and `mp4` audio:
 
 ~~~bash
 brew install ffmpeg
 ~~~
 
-**macOS note:** TensorFlow may require Apple-specific packages.  
-If standard `tensorflow` fails to install, remove it from `requirements.txt` and install:
+If standard TensorFlow installation fails on Apple Silicon, you may need:
 
 ~~~bash
 pip install tensorflow-macos tensorflow-metal
@@ -68,17 +74,18 @@ python offlineclassify.py --audio Recording.wav --sample_hz 1.0 --top_k 5
 
 ### CLI arguments
 
-- `--audio` (required): Path to an audio file (`.wav`, `.flac`, etc.)
-- `--sample_hz` (default: `1.0`): How often to emit predictions (frames per second)
-  - Example: `2.0` → prediction every `0.5s`, `0.5` → prediction every `2s`
-- `--top_k` (default: `5`): Number of top labels to save per frame
-- `--window_s` (default: `0.975`): Window size (seconds) used for each prediction
-- `--auto_window`: Override the window size using the model input length
-- `--avg_frames` (default: `1`): Temporal smoothing (average over last `N` frames)
-- `--out_json` (default: `predictions.jsonl`): Output path for top-k JSONL predictions
-- `--out_npz` (default: `predictions_full.npz`): Output path for full score vectors
-- `--model` (default: `yamnet.tflite`): Model path
-- `--labels` (default: `yamnet_class_map.csv`): Label map path
+- `--audio` (required): path to an audio file (`.wav`, `.flac`, etc.)
+- `--sample_hz` (default: `1.0`): how often to emit predictions (frames per second)
+  - `2.0` → prediction every `0.5s`
+  - `0.5` → prediction every `2s`
+- `--top_k` (default: `5`): number of top labels to save per frame
+- `--window_s` (default: `0.975`): window size (seconds) used for each prediction
+- `--auto_window`: override the window size using the model input length
+- `--avg_frames` (default: `1`): temporal smoothing over the last `N` frames
+- `--out_json` (default: `predictions.jsonl`): output path for top-k JSONL predictions
+- `--out_npz` (default: `predictions_full.npz`): output path for full score vectors
+- `--model` (default: `yamnet.tflite`): model path
+- `--labels` (default: `yamnet_class_map.csv`): label map path
 
 ### Example with smoothing and full-vector output
 
@@ -97,7 +104,7 @@ python offlineclassify.py \
 
 The default top-k output is **JSON Lines** (one JSON object per time step).
 
-Each line looks like:
+Example:
 
 ~~~json
 {
@@ -121,66 +128,78 @@ If `--out_npz` is enabled, the CLI also writes a compressed `.npz` file containi
 
 ---
 
-## 3) Visualizing Results (`viz_app.py`)
+## 3) Running the Streamlit app suite
 
-A localhost dashboard is provided via Streamlit for exploring saved results.
+The app now uses a **main entrypoint** with explicit page navigation.
 
 Run it with:
 
 ~~~bash
-streamlit run viz_app.py
+streamlit run dashboard_app.py
 ~~~
 
-### What it includes
+This launches a multipage app with sidebar navigation.
 
-- Top-1 label timeline over time
-- Confidence threshold slider
-- Collapsed event-segment table (contiguous runs)
-- Per-frame top-k inspection at selected timestamps
+### Pages
 
----
+#### Comparison Dashboard
+Implemented in `pages/compare_app.py`.
 
-## 4) Upload + Compare Dashboard (`dashboard_compare.py`)
-
-This dashboard supports three workflows:
+Supports three workflows:
 
 1. Upload an audio file → run offline classification → step through predictions
 2. Upload an annotations file (`JSONL` / `JSON` / `CSV` / `NPZ`) → inspect predictions
 3. Upload audio + annotations → run offline classification and compare uploaded annotations against offline output side by side
 
-Run it with:
+Main features:
 
-~~~bash
-streamlit run dashboard_compare.py
-~~~
+- upload audio and run offline inference directly in the app
+- upload offline or real-time annotation files for inspection
+- compare uploaded annotations against offline inference frame by frame
+- confidence filtering for cleaner inspection
+- live playback-synced frame inspection (when supported by your Streamlit version)
+- download offline predictions as `JSONL` or full-vector `NPZ`
+- reduced UI clutter through collapsible sections and tabbed comparison views
 
-### Main features
-
-- Upload audio and run offline inference directly in the dashboard
-- Upload offline or real-time annotation files for inspection
-- Compare uploaded annotations against offline inference frame by frame
-- Confidence filtering for cleaner inspection
-- Live playback-synced frame inspection (when supported by your Streamlit version)
-- Download offline predictions as `JSONL` or full-vector `NPZ`
-
-### Stereo audio support in `dashboard_compare.py`
-
-The compare dashboard supports multiple stereo handling modes:
+Stereo support includes:
 
 - **Mono mixdown** — mix channels to mono before classification
-- **Stereo: LEFT/RIGHT separate** — classify each channel independently and output both
-- **Stereo: LEFT/RIGHT average** — classify each channel independently and average the per-class scores for a combined output
+- **Stereo: LEFT/RIGHT separate** — classify each channel independently
+- **Stereo: LEFT/RIGHT average** — classify each channel independently and average per-class scores
 
-When stereo outputs are available, the dashboard can also show:
+When stereo outputs are available, the app can show:
 
 - LEFT vs RIGHT side-by-side inspection
 - LEFT vs RIGHT agreement metrics
 - channel-specific output downloads
 - stereo-aware comparisons against uploaded annotations
 
-### Comparison metrics
+#### Help / Reference
+Implemented in `pages/help_app.py`.
 
-The compare dashboard includes metrics such as:
+Provides documentation for:
+
+- metric definitions
+- parameter meanings
+- YAMNet / AudioSet background
+- supported input formats
+- notes on stereo handling and comparison behavior
+
+#### Visualization Page
+Implemented in `pages/viz_app.py`.
+
+Provides a lightweight interface for exploring saved classification results, including:
+
+- top-label inspection over time
+- confidence filtering
+- event/activity exploration
+- per-frame top-k inspection
+
+---
+
+## 4) Comparison metrics
+
+The comparison dashboard includes metrics such as:
 
 - Frames compared
 - Average overlap in top-k labels
@@ -189,17 +208,26 @@ The compare dashboard includes metrics such as:
 - Average Jaccard similarity over top-k label sets
 - Average absolute score difference on common labels
 
-In stereo mode, the dashboard can also report **LEFT vs RIGHT channel agreement** metrics for the offline outputs.
+In stereo mode, the app can also report **LEFT vs RIGHT channel agreement** metrics for offline outputs.
 
-### Label timeline visualization
+The help page includes definitions and interpretation notes for these metrics.
 
-The compare dashboard also includes label-over-time visualizations to help inspect how categories appear across the audio:
+---
+
+## 5) Label timeline visualization
+
+The comparison and visualization pages include label-over-time visualizations to help inspect how categories appear across the audio:
 
 - label presence over time
 - score-based or binary-presence views
 - side-by-side timeline views when comparing two outputs
 
-This is useful for spotting persistent labels, label transitions, and channel-specific events in stereo recordings.
+This is useful for spotting:
+
+- persistent labels
+- label transitions
+- channel-specific events in stereo recordings
+- noisy or inconsistent outputs
 
 ---
 
@@ -230,7 +258,7 @@ brew install ffmpeg
 
 ## Supported annotation formats
 
-The dashboard accepts:
+The comparison dashboard accepts:
 
 - `JSONL` in the same format as `offlineclassify.py` output
 - `JSON` containing a list of predictions or `{ "predictions": [...] }`
@@ -259,11 +287,28 @@ Android-style wide CSV files are automatically converted into the internal long-
 
 ---
 
+## Upload size configuration
+
+File upload size limit is handled through Streamlit's config file:
+
+`.streamlit/config.toml`
+
+~~~toml
+[server]
+maxUploadSize = 1024
+~~~
+
+This version sets the max upload size at 1024MB.
+
+---
+
 ## Additional notes
 
 - YAMNet expects **16 kHz** waveform input; audio is resampled accordingly before inference
-- `dashboard_compare.py` can handle stereo audio using selectable channel-handling modes
-- `metadata.json` is not required for inference
+- uploaded audio is decoded and cached where possible to reduce repeated load cost
+- uploaded annotation parsing is cached where possible to improve responsiveness
+- stale results are cleared when uploaded files change, so the dashboard stays in sync with current inputs
 - `yamnet_class_map.csv` should match the model’s class ordering exactly
 - `predictions.jsonl` stores only the saved **top-k** labels per frame
 - `predictions_full.npz` stores the full **521-dimensional** score vectors when enabled
+- `metadata.json` is not required for inference
