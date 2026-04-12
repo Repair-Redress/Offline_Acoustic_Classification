@@ -116,9 +116,9 @@ Typical fields:
 }
 ```
 
-## Important Design Choices
+## Design Notes
 
-### Raw and adjusted scores are both preserved
+### Output contains raw and adjusted scores
 
 The pipeline does not overwrite the acoustic model output.
 
@@ -129,7 +129,7 @@ It keeps:
 
 This makes the system easier to inspect and audit.
 
-### The context layer is rule-based
+### Rule-based context
 
 At this stage, semantic fusion is not done with a large language model in the inference loop.
 
@@ -139,13 +139,9 @@ Instead, the pipeline uses:
 - interpretable rule-based boosts and suppressions
 - explicit adjustment weights
 
-This was chosen to keep the system offline-friendly and easier to debug.
+### Conservative Semantic interpretation
 
-### The summary is intentionally conservative
-
-The pipeline now tries to avoid overclaiming.
-
-It:
+The pipeline tries to avoid overzealous summaries.
 
 - filters out low-value labels such as `Silence` for semantic scene summaries
 - downweights contradictory indoor labels for strong outdoor context
@@ -175,11 +171,3 @@ Use the outputs carefully when:
 - the top class is mostly `Silence`
 - non-silence confidence is low
 - context and audio evidence disagree strongly
-
-## Suggested Next Steps
-
-- integrate semantic outputs into the Streamlit comparison/visualization tools
-- keep tuning context rules on more recordings
-- add better scene-level confidence calibration
-- create evaluation examples with human-checked expected scenes
-- explore fine-tuning or retraining only after the rule-based baseline is stable
