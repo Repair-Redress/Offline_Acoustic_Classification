@@ -1,0 +1,13 @@
+{
+  "tags": ["indoor", "office"],
+  "scene": {
+    "environment": "indoor",
+    "indoor_outdoor": "indoor"
+  },
+  "weather": {
+    "summary": "clear"
+  },
+  "recording": {
+    "notes": "Meeting room recording."
+  }
+}
