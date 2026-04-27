@@ -8,20 +8,33 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import scipy.signal
-import soundfile as sf
-from pydub import AudioSegment
+
+try:
+    import soundfile as sf
+except ImportError:
+    sf = None
+
+try:
+    from pydub import AudioSegment
+except ImportError:
+    AudioSegment = None
 
 try:
     import tflite_runtime.interpreter as tflite
 
     Interpreter = tflite.Interpreter
 except ImportError:
-    import tensorflow as tf
+    try:
+        import tensorflow as tf
 
-    Interpreter = tf.lite.Interpreter
+        Interpreter = tf.lite.Interpreter
+    except ImportError:
+        Interpreter = None
 
 
 def get_model_expected_len(model_path: str) -> int:
+    if Interpreter is None:
+        raise RuntimeError("Install tensorflow or tflite_runtime to load the YAMNet model.")
     interp = Interpreter(model_path=model_path)
     interp.allocate_tensors()
     input_details = interp.get_input_details()
@@ -79,13 +92,17 @@ def to_mono(x: np.ndarray) -> np.ndarray:
 
 
 def load_audio(audio_path: str) -> Tuple[np.ndarray, int]:
-    try:
-        waveform, sr = sf.read(audio_path, always_2d=False)
-        return np.asarray(waveform), int(sr)
-    except RuntimeError:
-        pass
-    except sf.LibsndfileError:
-        pass
+    if sf is not None:
+        try:
+            waveform, sr = sf.read(audio_path, always_2d=False)
+            return np.asarray(waveform), int(sr)
+        except RuntimeError:
+            pass
+        except sf.LibsndfileError:
+            pass
+
+    if AudioSegment is None:
+        raise RuntimeError("Install soundfile or pydub from requirements.txt to read audio files.")
 
     segment = AudioSegment.from_file(audio_path)
     sr = int(segment.frame_rate)
