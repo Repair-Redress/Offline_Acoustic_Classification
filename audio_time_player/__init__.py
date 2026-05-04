@@ -17,6 +17,7 @@ def audio_time_player(
     autoplay: bool = False,
     segment_token: str = "",
     report_time: bool = True,
+    emit_events: bool = True,
     key: Optional[str] = None,
 ) -> dict:
     """
@@ -33,6 +34,7 @@ def audio_time_player(
         autoplay=bool(autoplay),
         segment_token=str(segment_token or ""),
         report_time=bool(report_time),
+        emit_events=bool(emit_events),
         key=key,
         default={"t": 0.0},
     )

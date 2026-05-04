@@ -5,13 +5,29 @@
     <style>
       body { margin: 0; padding: 0; }
       audio { width: 100%; }
+      #segmentControls {
+        display: none;
+        margin-top: 6px;
+      }
+      #segmentControls button {
+        border: 1px solid #d0d0d0;
+        border-radius: 6px;
+        background: #fff;
+        padding: 5px 10px;
+        cursor: pointer;
+      }
     </style>
   </head>
   <body>
     <audio id="player" controls></audio>
+    <div id="segmentControls">
+      <button id="replaySegment" type="button">Replay segment</button>
+    </div>
 
     <script>
       const audio = document.getElementById("player");
+      const segmentControls = document.getElementById("segmentControls");
+      const replaySegment = document.getElementById("replaySegment");
 
       let timer = null;
       let pollMs = 250;
@@ -20,6 +36,7 @@
       let activeEndSec = null;
       let lastSegmentToken = "";
       let reportTime = true;
+      let emitEvents = true;
       let lastValueJson = "";
       let segmentEndedReported = false;
 
@@ -35,6 +52,7 @@
       }
 
       function setValue(extra) {
+        if (!emitEvents) return;
         const payload = Object.assign(
           {
             t: reportTime ? audio.currentTime || 0 : 0,
@@ -79,6 +97,13 @@
           audio.currentTime = activeStartSec !== null ? activeStartSec : 0;
           segmentEndedReported = false;
         }
+      }
+
+      function restartSegment(play) {
+        if (activeStartSec === null) return;
+        audio.currentTime = activeStartSec;
+        segmentEndedReported = false;
+        if (play) audio.play().catch(() => setValue({ autoplay_blocked: true }));
       }
 
       function b64ToBlob(b64, mime) {
@@ -132,6 +157,7 @@
         const code = audio.error ? audio.error.code : null;
         setValue({ needs_audio: true, error: code });
       });
+      replaySegment.addEventListener("click", () => restartSegment(true));
 
       window.addEventListener("message", (event) => {
         const data = event.data;
@@ -140,6 +166,7 @@
         const args = data.args || {};
         pollMs = Number(args.poll_ms || 250);
         reportTime = args.report_time !== false;
+        emitEvents = args.emit_events !== false;
         const h = Number(args.height || 90);
         activeStartSec =
           args.segment_token && Number.isFinite(Number(args.start_sec))
@@ -151,6 +178,7 @@
             : Number(args.end_sec);
         const startSec = Number(args.start_sec || 0);
         const segmentToken = String(args.segment_token || "");
+        segmentControls.style.display = segmentToken ? "block" : "none";
 
         // If Python sends audio, load it via Blob URL (avoids huge data: URL issues)
         if (args.audio_b64 && args.audio_b64.length > 0) {
@@ -198,7 +226,6 @@
       // Critical: apiVersion must be 1
       sendMessage("streamlit:componentReady", { apiVersion: 1 });
       setFrameHeight(90);
-      setValue({ needs_audio: true }); // on mount, ask for audio if missing
     </script>
   </body>
 </html>

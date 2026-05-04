@@ -609,26 +609,29 @@ def playback_time_seconds(
     segment_token: str = "",
     poll_ms: int = 250,
     report_time: bool = True,
+    emit_events: bool = True,
 ) -> float:
     src_key = hashlib.md5(audio_bytes).hexdigest()
     loaded_key = f"_semantic_audio_loaded_{key}"
     needs_key = f"_semantic_audio_needs_{key}"
-    needs_audio = bool(st.session_state.get(needs_key, True))
-    send_audio = needs_audio or (st.session_state.get(loaded_key) != src_key)
+    needs_audio = bool(st.session_state.get(needs_key, True)) if emit_events else False
+    send_audio = True if not emit_events else needs_audio or (st.session_state.get(loaded_key) != src_key)
     audio_b64 = base64.b64encode(audio_bytes).decode("ascii") if send_audio else ""
     state = audio_time_player(
         audio_b64=audio_b64,
         mime=_guess_mime(audio_name),
         poll_ms=poll_ms,
-        height=92,
+        height=130 if segment_token else 92,
         start_sec=start_sec,
         end_sec=end_sec,
         autoplay=autoplay,
         segment_token=segment_token,
         report_time=report_time,
+        emit_events=emit_events,
         key=key,
     )
-    st.session_state[needs_key] = bool(state.get("needs_audio", False))
+    if emit_events:
+        st.session_state[needs_key] = bool(state.get("needs_audio", False))
     if send_audio:
         st.session_state[loaded_key] = src_key
     return float(state.get("t", 0.0))
@@ -733,14 +736,33 @@ def has_context_values(value) -> bool:
 
 
 def manifest_json_bytes(segments_df: pd.DataFrame, source_filename: str) -> bytes:
-    rows = segments_df.to_dict(orient="records")
+    export_df = segments_df.copy()
+    if not export_df.empty and {"start_sec", "end_sec"}.issubset(export_df.columns):
+        export_df["start_time"] = export_df["start_sec"].apply(format_timestamp)
+        export_df["end_time"] = export_df["end_sec"].apply(format_timestamp)
+        export_df["duration"] = (export_df["end_sec"] - export_df["start_sec"]).apply(format_duration)
+    rows = export_df.to_dict(orient="records")
     payload = {"source_filename": source_filename, "segments": rows}
     return json.dumps(payload, indent=2).encode("utf-8")
 
 
+def format_timestamp(total_seconds: float) -> str:
+    if total_seconds is None or not np.isfinite(float(total_seconds)):
+        return "00:00"
+    total = max(0, int(round(float(total_seconds))))
+    minutes, seconds = divmod(total, 60)
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def format_duration(total_seconds: float) -> str:
+    return format_timestamp(total_seconds)
+
+
 def safe_chunk_filename(row: pd.Series, index: int) -> str:
     label = re.sub(r"[^A-Za-z0-9._-]+", "_", str(row["label"])).strip("_") or "segment"
-    return f"{index:03d}_{float(row['start_sec']):.2f}-{float(row['end_sec']):.2f}_{label}.wav"
+    start_text = format_timestamp(float(row["start_sec"])).replace(":", "-")
+    end_text = format_timestamp(float(row["end_sec"])).replace(":", "-")
+    return f"{index:03d}_{start_text}-{end_text}_{label}.wav"
 
 
 def salient_chunks_zip_bytes(segments_df: pd.DataFrame, waveform: np.ndarray, sr: int, source_filename: str) -> bytes:
@@ -761,6 +783,9 @@ def salient_chunks_zip_bytes(segments_df: pd.DataFrame, waveform: np.ndarray, sr
             zf.writestr(filename, wav_buffer.getvalue())
             manifest_row = dict(row.to_dict())
             manifest_row["chunk_file"] = filename
+            manifest_row["start_time"] = format_timestamp(float(row["start_sec"]))
+            manifest_row["end_time"] = format_timestamp(float(row["end_sec"]))
+            manifest_row["duration"] = format_duration(float(row["end_sec"]) - float(row["start_sec"]))
             manifest_rows.append(manifest_row)
         zf.writestr(
             "manifest.json",
@@ -775,6 +800,9 @@ def render_segment_timeline(segments_df: pd.DataFrame):
         return None
     plot_df = segments_df.copy()
     plot_df["duration_sec"] = plot_df["end_sec"] - plot_df["start_sec"]
+    plot_df["start_time"] = plot_df["start_sec"].apply(format_timestamp)
+    plot_df["end_time"] = plot_df["end_sec"].apply(format_timestamp)
+    plot_df["duration_time"] = plot_df["duration_sec"].apply(format_duration)
     label_order = (
         plot_df.groupby("label")
         .agg(max_peak=("peak_score", "max"), first_start=("start_sec", "min"))
@@ -789,23 +817,27 @@ def render_segment_timeline(segments_df: pd.DataFrame):
             base=plot_df["start_sec"],
             orientation="h",
             marker={"color": plot_df["peak_score"], "colorscale": "Viridis", "colorbar": {"title": "Peak"}},
-            customdata=plot_df[["segment_id", "start_sec", "end_sec", "label"]].to_numpy(),
+            customdata=plot_df[["segment_id", "start_time", "end_time", "label", "duration_time"]].to_numpy(),
             hovertemplate=(
                 "<b>%{customdata[3]}</b><br>"
                 "Segment %{customdata[0]}<br>"
-                "Start %{customdata[1]:.2f}s<br>"
-                "End %{customdata[2]:.2f}s<br>"
-                "Duration %{x:.2f}s<extra></extra>"
+                "Start %{customdata[1]}<br>"
+                "End %{customdata[2]}<br>"
+                "Duration %{customdata[4]}<extra></extra>"
             ),
         )
     )
     fig.update_layout(
         height=max(320, 44 * len(label_order) + 110),
-        xaxis_title="Time in original audio (s)",
+        xaxis_title="Timestamp",
         yaxis_title="AudioSet label",
         margin={"l": 10, "r": 10, "t": 10, "b": 10},
         bargap=0.32,
     )
+    tick_max = float(plot_df["end_sec"].max()) if not plot_df.empty else 0.0
+    tick_step = 60 if tick_max > 300 else 30 if tick_max > 120 else 15
+    tick_vals = np.arange(0, tick_max + tick_step, tick_step)
+    fig.update_xaxes(tickvals=tick_vals, ticktext=[format_timestamp(value) for value in tick_vals])
     fig.update_yaxes(categoryorder="array", categoryarray=list(reversed(label_order)))
     try:
         return st.plotly_chart(fig, width="stretch", on_select="rerun", selection_mode="points")
@@ -817,6 +849,18 @@ def render_segment_timeline(segments_df: pd.DataFrame):
 def top_non_silence_label(row: np.ndarray, labels: list[str]) -> str:
     items = top_k_non_silence_labels(row, labels, 1)
     return items[0]["label"] if items else "No non-silence label"
+
+
+def clear_semantic_output_state() -> None:
+    for key in (
+        "semantic_result",
+        "semantic_selected_segment_id",
+        "semantic_prepared_chunks_zip",
+    ):
+        st.session_state.pop(key, None)
+    for key in list(st.session_state.keys()):
+        if key.startswith("_semantic_audio_loaded_") or key.startswith("_semantic_audio_needs_"):
+            st.session_state.pop(key, None)
 
 
 model_path = "yamnet.tflite"
@@ -834,6 +878,21 @@ with input_col2:
         type=["csv", "json"],
         help="Use a YAMNet class-map CSV/JSON, or a metadata file that includes label names and recording context.",
     )
+
+if audio_file is None:
+    if st.session_state.get("semantic_uploaded_audio_signature") is not None or st.session_state.get("semantic_result") is not None:
+        clear_semantic_output_state()
+    st.session_state["semantic_uploaded_audio_signature"] = None
+else:
+    uploaded_audio_bytes = audio_file.getvalue()
+    uploaded_audio_signature = {
+        "name": audio_file.name,
+        "size": len(uploaded_audio_bytes),
+        "md5": hashlib.md5(uploaded_audio_bytes).hexdigest(),
+    }
+    if st.session_state.get("semantic_uploaded_audio_signature") != uploaded_audio_signature:
+        clear_semantic_output_state()
+        st.session_state["semantic_uploaded_audio_signature"] = uploaded_audio_signature
 
 uploaded_metadata = metadata_from_label_file(label_metadata_file)
 
@@ -874,7 +933,7 @@ if run_clicked and audio_file is not None:
     with st.spinner("Running semantic pipeline..."):
         labels = load_labels_from_upload(label_metadata_file)
         interpreter = load_interpreter(model_path)
-        audio_bytes = audio_file.getvalue()
+        audio_bytes = uploaded_audio_bytes
         result_key = semantic_result_key(
             audio_bytes=audio_bytes,
             label_file=label_metadata_file,
@@ -992,7 +1051,7 @@ if result is not None:
     playback_slot = st.empty()
 
     scene_text = html.escape(summary.semantic_scene.title())
-    duration_text = html.escape(f"{audio_stats['duration_sec']:.1f} s")
+    duration_text = html.escape(format_duration(float(audio_stats["duration_sec"])))
     confidence = float(summary.evidence["scene_confidence"])
     confidence_text = html.escape(f"{confidence:.0%}")
     st.markdown(
@@ -1072,9 +1131,12 @@ if result is not None:
 
         table_df = visible_segments_df.copy()
         if not table_df.empty:
+            table_df["start_time"] = table_df["start_sec"].apply(format_timestamp)
+            table_df["end_time"] = table_df["end_sec"].apply(format_timestamp)
+            table_df["duration"] = (table_df["end_sec"] - table_df["start_sec"]).apply(format_duration)
             table_df["description"] = table_df.apply(
                 lambda row: (
-                    f"{row['label']} is salient from {row['start_sec']:.2f}s to {row['end_sec']:.2f}s "
+                    f"{row['label']} is salient from {row['start_time']} to {row['end_time']} "
                     f"(peak={row['peak_score']:.3f})."
                 ),
                 axis=1,
@@ -1082,15 +1144,16 @@ if result is not None:
             table_df = table_df[
                 [
                     "segment_id",
-                    "start_sec",
-                    "end_sec",
+                    "start_time",
+                    "end_time",
+                    "duration",
                     "label",
                     "description",
                     "peak_score",
                     "mean_score",
                     "frame_count",
                 ]
-            ].rename(columns={"start_sec": "start_time_sec", "end_sec": "end_time_sec"})
+            ]
         try:
             table_event = st.dataframe(
                 table_df,
@@ -1116,7 +1179,7 @@ if result is not None:
                     visible_segments_df["segment_id"].tolist(),
                     format_func=lambda sid: (
                         visible_segments_df.loc[visible_segments_df["segment_id"] == sid, "label"].iloc[0]
-                        + f" ({visible_segments_df.loc[visible_segments_df['segment_id'] == sid, 'start_sec'].iloc[0]:.2f}s)"
+                        + f" ({format_timestamp(visible_segments_df.loc[visible_segments_df['segment_id'] == sid, 'start_sec'].iloc[0])})"
                     ),
                 )
                 if st.button("Open selected segment"):
@@ -1132,7 +1195,8 @@ if result is not None:
         if selected_segment is not None:
             st.caption(
                 f"Selected segment: {selected_segment['label']} "
-                f"({float(selected_segment['start_sec']):.2f}s to {float(selected_segment['end_sec']):.2f}s). "
+                f"({format_timestamp(float(selected_segment['start_sec']))} to "
+                f"{format_timestamp(float(selected_segment['end_sec']))}). "
                 "Playback is restricted to this segment until it is deselected."
             )
             playback_start_sec = float(selected_segment["start_sec"])
@@ -1169,6 +1233,7 @@ if result is not None:
                 segment_token=playback_token,
                 poll_ms=500,
                 report_time=False,
+                emit_events=False,
             )
 
     with st.expander("Top adjustments", expanded=False):
@@ -1181,13 +1246,14 @@ if result is not None:
     frame_times = pd.DataFrame(
         {
             "t_sec": t_sec,
+            "time": [format_timestamp(value) for value in t_sec],
             "raw_top_1": [top_non_silence_label(row, labels) for row in raw_scores],
             "adjusted_top_1": [top_non_silence_label(row, labels) for row in adjusted_scores],
         }
     )
     with st.expander("Top-1 timeline preview", expanded=False):
         timeline_plot_df = frame_times.melt(
-            id_vars="t_sec",
+            id_vars=["t_sec", "time"],
             value_vars=["raw_top_1", "adjusted_top_1"],
             var_name="score_source",
             value_name="label",
@@ -1201,13 +1267,18 @@ if result is not None:
             y="label",
             color="score_source",
             symbol="score_source",
-            labels={"t_sec": "Time (s)", "label": "Top-1 label", "score_source": "Score source"},
+            hover_data={"t_sec": False, "time": True, "label": True, "score_source": True},
+            labels={"t_sec": "Time", "time": "Time", "label": "Top-1 label", "score_source": "Score source"},
             height=380,
         )
         timeline_fig.update_traces(marker={"size": 8})
         timeline_fig.update_layout(margin={"l": 10, "r": 10, "t": 10, "b": 10})
+        tick_max = float(frame_times["t_sec"].max()) if not frame_times.empty else 0.0
+        tick_step = 60 if tick_max > 300 else 30 if tick_max > 120 else 15
+        tick_vals = np.arange(0, tick_max + tick_step, tick_step)
+        timeline_fig.update_xaxes(title_text="Time (MM:SS)", tickvals=tick_vals, ticktext=[format_timestamp(value) for value in tick_vals])
         st.plotly_chart(timeline_fig, width="stretch")
-        st.dataframe(frame_times, width="stretch", hide_index=True)
+        st.dataframe(frame_times[["time", "raw_top_1", "adjusted_top_1"]], width="stretch", hide_index=True)
 
     download_col1, download_col2, download_col3 = st.columns(3)
     with download_col1:
