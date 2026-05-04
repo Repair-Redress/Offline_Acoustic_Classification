@@ -62,11 +62,11 @@ st.subheader("Top-1 label over time")
 top1_f = top1[top1["score1"] >= threshold].copy()
 fig = px.scatter(top1_f, x="t_sec", y="top1", color="top1", hover_data=["score1"], height=450)
 fig.update_layout(showlegend=False, xaxis_title="Time (s)", yaxis_title="Top-1 label")
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig, width="stretch")
 
 st.subheader("Event segments (collapsed runs)")
 segs = make_segments(top1, min_score=threshold)
-st.dataframe(segs, use_container_width=True)
+st.dataframe(segs, width="stretch")
 
 st.subheader("Inspect predictions at a time")
 tmin, tmax = float(top1["t_sec"].min()), float(top1["t_sec"].max())
@@ -77,4 +77,4 @@ t_near = float(top1.loc[idx, "t_sec"])
 st.write(f"Nearest frame: t = {t_near:.3f}s, top1 = {top1.loc[idx,'top1']} ({top1.loc[idx,'score1']:.3f})")
 
 frame = df[df["t_sec"] == t_near].sort_values("rank")[["rank","label","score"]]
-st.dataframe(frame, use_container_width=True)
+st.dataframe(frame, width="stretch")

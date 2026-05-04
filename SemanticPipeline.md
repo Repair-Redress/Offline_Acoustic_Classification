@@ -108,6 +108,7 @@ When coordinates are available, the context enrichment layer can add:
 ### 3. Rule-Based Context Adjustment
 
 Context adjustment is performed by `build_context_adjustment()` in `semantic_pipeline.py`.
+The adjustment groups and rules are stored in `context_rules.json`, and the dashboard includes a **Context Rules** page for editing that structured repo-backed file.
 
 The process is intentionally interpretable:
 
@@ -138,6 +139,7 @@ The process is intentionally interpretable:
    - Raw scores remain available for comparison.
 
 The summary includes **Top rule impacts**, which lists the largest label-level adjustments, the rule name, whether it was a boost or suppression, the label affected, the weight, and the matched context terms.
+Rule edits saved from the dashboard apply to future semantic classification runs after validation.
 
 ## Semantic Summary
 
@@ -167,7 +169,7 @@ This makes it possible to inspect cases where:
 
 ## Current Limitations
 
-- The context rules are hand-built and should be tuned as more recordings are reviewed.
+- The context rules are hand-built in `context_rules.json` and should be tuned as more recordings are reviewed.
 - API enrichment depends on available coordinates, timestamp quality, and network access.
 - Weather and reverse-geocoding add context, not ground truth.
 - YAMNet can still produce noisy labels for quiet, clipped, or ambiguous recordings.

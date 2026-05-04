@@ -1,0 +1,80 @@
+{
+  "label_pattern_sets": {
+    "speech": ["speech", "conversation", "narration", "whisper", "babbling", "shout", "screaming"],
+    "music": ["music", "singing", "choir", "piano", "guitar", "drum", "musical instrument"],
+    "birds": ["bird", "chirp", "tweet", "owl", "crow", "pigeon"],
+    "wind": ["wind", "rustling leaves"],
+    "rain": ["rain", "thunderstorm", "thunder", "raindrop"],
+    "water": ["water", "stream", "ocean", "waves", "pour", "drip", "rain"],
+    "traffic": ["car", "bus", "motor vehicle", "truck", "motorcycle", "traffic", "engine", "vehicle horn", "car horn", "siren"],
+    "road": ["vehicle horn", "car horn", "honking", "siren", "brake", "skidding", "traffic noise"],
+    "construction": ["jackhammer", "drill", "hammer", "power tool", "construction", "chainsaw"],
+    "industrial": ["machine", "engine", "compressor", "mechanical fan", "tools"],
+    "indoors": ["typing", "printer", "keyboard", "clicking", "door", "drawer", "cutlery", "dishes", "speech"],
+    "office": ["typing", "clicking", "printer", "speech", "telephone", "computer keyboard"],
+    "residential": ["dog", "cat", "speech", "television", "vacuum cleaner", "doorbell"],
+    "nature": ["bird", "insect", "wind", "water", "frog", "cricket", "rain"],
+    "animals": ["dog", "cat", "bird", "frog", "insect", "livestock"],
+    "crowd": ["crowd", "cheering", "clapping", "applause", "speech"]
+  },
+  "context_rules": [
+    {
+      "name": "rainy_weather",
+      "signals": ["rain", "drizzle", "storm", "wet", "precipitation", "weathercode_rain"],
+      "boost": {"rain": 1.35, "water": 1.18, "wind": 1.1},
+      "suppress": {"construction": 0.94}
+    },
+    {
+      "name": "windy_weather",
+      "signals": ["windy", "gust", "wind", "weathercode_wind"],
+      "boost": {"wind": 1.3, "nature": 1.08, "traffic": 1.05}
+    },
+    {
+      "name": "urban_scene",
+      "signals": ["urban", "city", "downtown", "road", "street", "avenue", "traffic corridor"],
+      "boost": {"traffic": 1.3, "road": 1.18, "crowd": 1.08, "construction": 1.1},
+      "suppress": {"nature": 0.88}
+    },
+    {
+      "name": "rural_scene",
+      "signals": ["rural", "farmland", "countryside", "village", "field"],
+      "boost": {"nature": 1.28, "animals": 1.12, "wind": 1.06},
+      "suppress": {"traffic": 0.82, "construction": 0.9}
+    },
+    {
+      "name": "indoor_scene",
+      "signals": ["indoor", "indoors", "inside", "room", "hallway"],
+      "boost": {"indoors": 1.22, "office": 1.08, "speech": 1.04},
+      "suppress": {"birds": 0.72, "wind": 0.8, "rain": 0.84}
+    },
+    {
+      "name": "office_scene",
+      "signals": ["office", "meeting room", "workplace", "lab", "classroom"],
+      "boost": {"office": 1.35, "speech": 1.08, "indoors": 1.08},
+      "suppress": {"nature": 0.82}
+    },
+    {
+      "name": "outdoor_scene",
+      "signals": ["outdoor", "outdoors", "outside", "open air"],
+      "boost": {"nature": 1.18, "traffic": 1.06, "wind": 1.08},
+      "suppress": {"office": 0.82},
+      "suppress_labels": {
+        "inside, small room": 0.58,
+        "inside, large room or hall": 0.62,
+        "reverberation": 0.8
+      }
+    },
+    {
+      "name": "industrial_scene",
+      "signals": ["industrial", "factory", "warehouse", "plant", "machinery"],
+      "boost": {"industrial": 1.35, "construction": 1.16, "traffic": 1.05},
+      "suppress": {"birds": 0.84}
+    },
+    {
+      "name": "residential_scene",
+      "signals": ["residential", "home", "apartment", "neighborhood"],
+      "boost": {"residential": 1.28, "speech": 1.06, "animals": 1.05},
+      "suppress": {"industrial": 0.86}
+    }
+  ]
+}

@@ -1,14 +1,18 @@
 import io
+import base64
 import csv
+import hashlib
 import html
 import json
 import re
 import sys
+import zipfile
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 try:
@@ -22,16 +26,19 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from context_enrichment import enrich_context, merge_context
 from semantic_pipeline import (
-    Interpreter,
+    DEFAULT_CONTEXT_RULES_PATH,
     build_context_adjustment,
     build_semantic_summary,
     compute_audio_stats,
+    create_interpreter,
     get_model_expected_len,
     load_labels,
+    top_k_non_silence_labels,
     top_k_labels,
     to_mono,
     classify_waveform,
 )
+from audio_time_player import audio_time_player
 
 
 st.set_page_config(page_title="Semantic Classification", layout="wide")
@@ -86,9 +93,7 @@ st.markdown(
 
 @st.cache_resource
 def load_interpreter(model_path: str):
-    if Interpreter is None:
-        raise RuntimeError("Install tensorflow or tflite_runtime to run YAMNet inference.")
-    interp = Interpreter(model_path=model_path)
+    interp = create_interpreter(model_path)
     interp.allocate_tensors()
     return interp
 
@@ -96,6 +101,15 @@ def load_interpreter(model_path: str):
 @st.cache_data(show_spinner=False)
 def load_labels_cached(labels_path: str):
     return load_labels(labels_path)
+
+
+@st.cache_data(show_spinner=False)
+def load_rules_config_cached(rules_text: str) -> dict:
+    config = json.loads(rules_text)
+    from semantic_pipeline import validate_context_rules_config
+
+    validate_context_rules_config(config)
+    return config
 
 
 @st.cache_data(show_spinner=False)
@@ -570,8 +584,246 @@ def summary_json_bytes(summary, context: dict, adjustment_vector: np.ndarray, la
     return json.dumps(payload, indent=2).encode("utf-8")
 
 
+def _guess_mime(audio_name: str) -> str:
+    ext = Path(audio_name or "").suffix.lower().lstrip(".")
+    if ext == "wav":
+        return "audio/wav"
+    if ext == "mp3":
+        return "audio/mpeg"
+    if ext in ("m4a", "mp4"):
+        return "audio/mp4"
+    if ext == "flac":
+        return "audio/flac"
+    if ext == "ogg":
+        return "audio/ogg"
+    return "audio/wav"
+
+
+def playback_time_seconds(
+    audio_bytes: bytes,
+    audio_name: str,
+    key: str,
+    start_sec: float = 0.0,
+    end_sec: float | None = None,
+    autoplay: bool = False,
+    segment_token: str = "",
+    poll_ms: int = 250,
+    report_time: bool = True,
+) -> float:
+    src_key = hashlib.md5(audio_bytes).hexdigest()
+    loaded_key = f"_semantic_audio_loaded_{key}"
+    needs_key = f"_semantic_audio_needs_{key}"
+    needs_audio = bool(st.session_state.get(needs_key, True))
+    send_audio = needs_audio or (st.session_state.get(loaded_key) != src_key)
+    audio_b64 = base64.b64encode(audio_bytes).decode("ascii") if send_audio else ""
+    state = audio_time_player(
+        audio_b64=audio_b64,
+        mime=_guess_mime(audio_name),
+        poll_ms=poll_ms,
+        height=92,
+        start_sec=start_sec,
+        end_sec=end_sec,
+        autoplay=autoplay,
+        segment_token=segment_token,
+        report_time=report_time,
+        key=key,
+    )
+    st.session_state[needs_key] = bool(state.get("needs_audio", False))
+    if send_audio:
+        st.session_state[loaded_key] = src_key
+    return float(state.get("t", 0.0))
+
+
+def visible_segments_key(segments_df: pd.DataFrame, audio_bytes: bytes, audio_name: str) -> str:
+    payload = {
+        "audio_md5": hashlib.md5(audio_bytes).hexdigest(),
+        "audio_name": audio_name,
+        "segments": segments_df.to_json(orient="records", double_precision=6),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def semantic_result_key(
+    audio_bytes: bytes,
+    label_file,
+    rules_text: str,
+    sample_hz: float,
+    avg_frames: int,
+    top_k: int,
+    auto_window: bool,
+    window_s: float,
+    manual_context: dict,
+    enrichment_request: dict,
+) -> str:
+    label_bytes = label_file.getvalue() if label_file is not None else b"bundled-labels"
+    payload = {
+        "audio_md5": hashlib.md5(audio_bytes).hexdigest(),
+        "labels_md5": hashlib.md5(label_bytes).hexdigest(),
+        "rules_md5": hashlib.md5(rules_text.encode("utf-8")).hexdigest(),
+        "sample_hz": float(sample_hz),
+        "avg_frames": int(avg_frames),
+        "top_k": int(top_k),
+        "auto_window": bool(auto_window),
+        "window_s": float(window_s),
+        "manual_context": manual_context,
+        "enrichment_request": enrichment_request,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def segments_dataframe(summary) -> pd.DataFrame:
+    df = pd.DataFrame(summary.salient_segments)
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                "segment_id",
+                "label",
+                "start_sec",
+                "end_sec",
+                "duration_sec",
+                "peak_score",
+                "mean_score",
+                "frame_count",
+                "score_type",
+            ]
+        )
+    df = df.copy().reset_index(drop=True)
+    df.insert(0, "segment_id", np.arange(1, len(df) + 1))
+    df["duration_sec"] = df["end_sec"].astype(float) - df["start_sec"].astype(float)
+    return df
+
+
+def filter_segments_df(
+    df: pd.DataFrame,
+    search_text: str,
+    include_labels: list[str],
+    exclude_labels: list[str],
+    min_peak_score: float,
+    min_mean_score: float,
+) -> pd.DataFrame:
+    out = df.copy()
+    if out.empty:
+        return out
+    if search_text.strip():
+        terms = [term.strip().lower() for term in re.split(r"[,;]+", search_text) if term.strip()]
+        if terms:
+            out = out[out["label"].str.lower().apply(lambda label: any(term in label for term in terms))]
+    if include_labels:
+        out = out[out["label"].isin(include_labels)]
+    if exclude_labels:
+        out = out[~out["label"].isin(exclude_labels)]
+    out = out[
+        (out["peak_score"].astype(float) >= float(min_peak_score))
+        & (out["mean_score"].astype(float) >= float(min_mean_score))
+    ]
+    return out.reset_index(drop=True)
+
+
+def has_context_values(value) -> bool:
+    if isinstance(value, dict):
+        return any(has_context_values(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(has_context_values(item) for item in value)
+    if value in ("", None):
+        return False
+    try:
+        return not bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return True
+
+
+def manifest_json_bytes(segments_df: pd.DataFrame, source_filename: str) -> bytes:
+    rows = segments_df.to_dict(orient="records")
+    payload = {"source_filename": source_filename, "segments": rows}
+    return json.dumps(payload, indent=2).encode("utf-8")
+
+
+def safe_chunk_filename(row: pd.Series, index: int) -> str:
+    label = re.sub(r"[^A-Za-z0-9._-]+", "_", str(row["label"])).strip("_") or "segment"
+    return f"{index:03d}_{float(row['start_sec']):.2f}-{float(row['end_sec']):.2f}_{label}.wav"
+
+
+def salient_chunks_zip_bytes(segments_df: pd.DataFrame, waveform: np.ndarray, sr: int, source_filename: str) -> bytes:
+    import soundfile as sf
+
+    buffer = io.BytesIO()
+    mono = np.asarray(waveform, dtype=np.float32)
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        manifest_rows = []
+        for index, (_, row) in enumerate(segments_df.iterrows(), start=1):
+            start_sample = max(0, int(round(float(row["start_sec"]) * sr)))
+            end_sample = min(len(mono), int(round(float(row["end_sec"]) * sr)))
+            if end_sample <= start_sample:
+                continue
+            filename = safe_chunk_filename(row, index)
+            wav_buffer = io.BytesIO()
+            sf.write(wav_buffer, mono[start_sample:end_sample], sr, format="WAV", subtype="PCM_16")
+            zf.writestr(filename, wav_buffer.getvalue())
+            manifest_row = dict(row.to_dict())
+            manifest_row["chunk_file"] = filename
+            manifest_rows.append(manifest_row)
+        zf.writestr(
+            "manifest.json",
+            json.dumps({"source_filename": source_filename, "segments": manifest_rows}, indent=2),
+        )
+    return buffer.getvalue()
+
+
+def render_segment_timeline(segments_df: pd.DataFrame):
+    if segments_df.empty:
+        st.info("No salient segments remain after filtering.")
+        return None
+    plot_df = segments_df.copy()
+    plot_df["duration_sec"] = plot_df["end_sec"] - plot_df["start_sec"]
+    label_order = (
+        plot_df.groupby("label")
+        .agg(max_peak=("peak_score", "max"), first_start=("start_sec", "min"))
+        .sort_values(["max_peak", "first_start"], ascending=[False, True])
+        .index.tolist()
+    )
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=plot_df["duration_sec"],
+            y=plot_df["label"],
+            base=plot_df["start_sec"],
+            orientation="h",
+            marker={"color": plot_df["peak_score"], "colorscale": "Viridis", "colorbar": {"title": "Peak"}},
+            customdata=plot_df[["segment_id", "start_sec", "end_sec", "label"]].to_numpy(),
+            hovertemplate=(
+                "<b>%{customdata[3]}</b><br>"
+                "Segment %{customdata[0]}<br>"
+                "Start %{customdata[1]:.2f}s<br>"
+                "End %{customdata[2]:.2f}s<br>"
+                "Duration %{x:.2f}s<extra></extra>"
+            ),
+        )
+    )
+    fig.update_layout(
+        height=max(320, 44 * len(label_order) + 110),
+        xaxis_title="Time in original audio (s)",
+        yaxis_title="AudioSet label",
+        margin={"l": 10, "r": 10, "t": 10, "b": 10},
+        bargap=0.32,
+    )
+    fig.update_yaxes(categoryorder="array", categoryarray=list(reversed(label_order)))
+    try:
+        return st.plotly_chart(fig, width="stretch", on_select="rerun", selection_mode="points")
+    except TypeError:
+        st.plotly_chart(fig, width="stretch")
+        return None
+
+
+def top_non_silence_label(row: np.ndarray, labels: list[str]) -> str:
+    items = top_k_non_silence_labels(row, labels, 1)
+    return items[0]["label"] if items else "No non-silence label"
+
+
 model_path = "yamnet.tflite"
 labels_path = "yamnet_class_map.csv"
+rules_path = DEFAULT_CONTEXT_RULES_PATH
+rules_text = rules_path.read_text(encoding="utf-8")
+rules_config = load_rules_config_cached(rules_text)
 
 input_col1, input_col2 = st.columns(2)
 with input_col1:
@@ -585,13 +837,7 @@ with input_col2:
 
 uploaded_metadata = metadata_from_label_file(label_metadata_file)
 
-try:
-    window_default = float(get_model_expected_len(model_path) / 16000.0)
-    model_runtime_available = Interpreter is not None
-except RuntimeError as exc:
-    window_default = 0.975
-    model_runtime_available = False
-    st.warning(str(exc))
+window_default = 0.975
 
 with st.expander("Model parameters", expanded=False):
     col_a, col_b, col_c = st.columns(3)
@@ -606,11 +852,22 @@ with st.expander("Model parameters", expanded=False):
     window_s = st.number_input("Window length (seconds)", min_value=0.1, value=window_default, step=0.025, disabled=auto_window)
 
 manual_context, enrichment_request = context_from_form(uploaded_metadata)
+has_manual_or_metadata_context = has_context_values(uploaded_metadata) or has_context_values(manual_context)
+has_auto_context_inputs = bool(
+    enrichment_request.get("latitude") is not None
+    and enrichment_request.get("longitude") is not None
+    and enrichment_request.get("timestamp_text")
+)
+if audio_file is not None and not has_manual_or_metadata_context and not has_auto_context_inputs:
+    st.info(
+        "No context metadata is attached to this audio. For richer semantic context, run the file through "
+        "the offline classification workflow on the Comparison Dashboard first, then return with its labels/metadata output."
+    )
 run_clicked = st.button(
     "Run Semantic Classification",
     type="primary",
-    use_container_width=True,
-    disabled=audio_file is None or not model_runtime_available,
+    width="stretch",
+    disabled=audio_file is None,
 )
 
 if run_clicked and audio_file is not None:
@@ -618,10 +875,22 @@ if run_clicked and audio_file is not None:
         labels = load_labels_from_upload(label_metadata_file)
         interpreter = load_interpreter(model_path)
         audio_bytes = audio_file.getvalue()
+        result_key = semantic_result_key(
+            audio_bytes=audio_bytes,
+            label_file=label_metadata_file,
+            rules_text=rules_text,
+            sample_hz=float(sample_hz),
+            avg_frames=int(avg_frames),
+            top_k=int(top_k),
+            auto_window=bool(auto_window),
+            window_s=float(window_s),
+            manual_context=manual_context,
+            enrichment_request=enrichment_request,
+        )
         waveform, sr = read_audio_from_upload(audio_bytes, audio_file.name)
         waveform = to_mono(np.asarray(waveform)).astype(np.float32)
         audio_stats = compute_audio_stats(waveform, sr)
-        effective_window_s = window_default if auto_window else float(window_s)
+        effective_window_s = float(get_model_expected_len(model_path) / 16000.0) if auto_window else float(window_s)
         t_sec, raw_scores = classify_waveform(
             interpreter,
             waveform,
@@ -663,7 +932,7 @@ if run_clicked and audio_file is not None:
             metadata_context = merge_context(metadata_context, uploaded_metadata["context"])
         context = merge_context(metadata_context, merge_context(automatic_context, context))
 
-        adjustment_vector, impacts, context_signals = build_context_adjustment(labels, context)
+        adjustment_vector, impacts, context_signals = build_context_adjustment(labels, context, rules_config=rules_config)
         adjusted_scores = np.clip(raw_scores * adjustment_vector[None, :], 0.0, 1.0)
         summary = build_semantic_summary(
             t_sec=t_sec,
@@ -676,8 +945,52 @@ if run_clicked and audio_file is not None:
             context_signals=context_signals,
             audio_stats=audio_stats,
         )
+        st.session_state.pop("semantic_selected_segment_id", None)
+        st.session_state["semantic_result"] = {
+            "result_key": result_key,
+            "audio_bytes": audio_bytes,
+            "audio_name": audio_file.name,
+            "waveform": waveform,
+            "sr": sr,
+            "audio_stats": audio_stats,
+            "effective_window_s": effective_window_s,
+            "t_sec": t_sec,
+            "raw_scores": raw_scores,
+            "adjusted_scores": adjusted_scores,
+            "labels": labels,
+            "top_k": int(top_k),
+            "context": context,
+            "adjustment_vector": adjustment_vector,
+            "summary": summary,
+        }
+
+result = st.session_state.get("semantic_result")
+if result is not None:
+    summary = result["summary"]
+    audio_stats = result["audio_stats"]
+    labels = result["labels"]
+    t_sec = result["t_sec"]
+    raw_scores = result["raw_scores"]
+    adjusted_scores = result["adjusted_scores"]
+    top_k_result = int(result["top_k"])
+    context = result["context"]
+    adjustment_vector = result["adjustment_vector"]
+    audio_bytes = result["audio_bytes"]
+    audio_name = result["audio_name"]
+    waveform = result["waveform"]
+    sr = int(result["sr"])
+    audio_stem = Path(audio_name).stem
+    all_segments_df = segments_dataframe(summary)
+    selected_segment_id = st.session_state.get("semantic_selected_segment_id")
+    selected_rows = all_segments_df[all_segments_df["segment_id"] == selected_segment_id] if selected_segment_id else pd.DataFrame()
+    if selected_segment_id and selected_rows.empty:
+        st.session_state.pop("semantic_selected_segment_id", None)
+        selected_segment_id = None
+    selected_segment = selected_rows.iloc[0] if not selected_rows.empty else None
 
     st.subheader("Semantic Output")
+    playback_slot = st.empty()
+
     scene_text = html.escape(summary.semantic_scene.title())
     duration_text = html.escape(f"{audio_stats['duration_sec']:.1f} s")
     confidence = float(summary.evidence["scene_confidence"])
@@ -711,33 +1024,165 @@ if run_clicked and audio_file is not None:
     with st.expander("Final context used by the semantic model", expanded=False):
         st.code(json.dumps(context, indent=2), language="json")
 
-    st.markdown("**Dominant non-silence labels**")
-    st.dataframe(pd.DataFrame(summary.dominant_non_silence_labels), use_container_width=True, hide_index=True)
+    with st.expander("Salient segments", expanded=True):
+        st.markdown("**Salient segment controls**")
+        audio_set_labels = sorted(str(label) for label in labels)
+        filter_col1, filter_col2 = st.columns([1.1, 1])
+        with filter_col1:
+            segment_search = st.text_input("Search AudioSet labels in salient segments", placeholder="speech, traffic, rain")
+            include_labels = st.multiselect(
+                "Show only these AudioSet labels",
+                audio_set_labels,
+                default=[],
+                help="Filters visible salient segments by YAMNet/AudioSet label, not context-rule groups.",
+            )
+            exclude_labels = st.multiselect(
+                "Hide these AudioSet labels",
+                audio_set_labels,
+                default=[],
+                help="Hides visible salient segments by YAMNet/AudioSet label, not context-rule groups.",
+            )
+        with filter_col2:
+            min_peak_score = st.slider("Minimum peak score", 0.0, 1.0, 0.0, 0.01)
+            min_mean_score = st.slider("Minimum mean score", 0.0, 1.0, 0.0, 0.01)
 
-    st.markdown("**Salient chunks**")
-    chunks_df = pd.DataFrame(summary.salient_segments)
-    if not chunks_df.empty:
-        chunks_df["descriptive_tags"] = chunks_df["label"]
-        chunks_df["description"] = chunks_df.apply(
-            lambda row: (
-                f"{row['label']} is salient from {row['start_sec']:.2f}s to {row['end_sec']:.2f}s "
-                f"(peak={row['peak_score']:.3f})."
-            ),
-            axis=1,
+        visible_segments_df = filter_segments_df(
+            all_segments_df,
+            search_text=segment_search,
+            include_labels=include_labels,
+            exclude_labels=exclude_labels,
+            min_peak_score=min_peak_score,
+            min_mean_score=min_mean_score,
         )
-        chunks_df = chunks_df[
-            ["start_sec", "end_sec", "descriptive_tags", "description", "peak_score", "mean_score", "frame_count"]
-        ].rename(columns={"start_sec": "start_time_sec", "end_sec": "end_time_sec"})
-    st.dataframe(chunks_df, use_container_width=True, hide_index=True)
+        st.markdown("**Salient segments over time**")
+        selection = render_segment_timeline(visible_segments_df)
+        selection_points = []
+        if selection:
+            try:
+                selection_points = selection.selection.points
+            except AttributeError:
+                selection_points = (selection.get("selection", {}) or {}).get("points", []) if isinstance(selection, dict) else []
+        if selection_points:
+            point = selection_points[0]
+            customdata = point.get("customdata") or []
+            if customdata:
+                new_segment_id = int(customdata[0])
+                if st.session_state.get("semantic_selected_segment_id") != new_segment_id:
+                    st.session_state["semantic_selected_segment_id"] = new_segment_id
 
-    st.markdown("**Top adjustments**")
-    st.dataframe(pd.DataFrame(summary.evidence["top_rule_impacts"]), use_container_width=True, hide_index=True)
+        table_df = visible_segments_df.copy()
+        if not table_df.empty:
+            table_df["description"] = table_df.apply(
+                lambda row: (
+                    f"{row['label']} is salient from {row['start_sec']:.2f}s to {row['end_sec']:.2f}s "
+                    f"(peak={row['peak_score']:.3f})."
+                ),
+                axis=1,
+            )
+            table_df = table_df[
+                [
+                    "segment_id",
+                    "start_sec",
+                    "end_sec",
+                    "label",
+                    "description",
+                    "peak_score",
+                    "mean_score",
+                    "frame_count",
+                ]
+            ].rename(columns={"start_sec": "start_time_sec", "end_sec": "end_time_sec"})
+        try:
+            table_event = st.dataframe(
+                table_df,
+                width="stretch",
+                hide_index=True,
+                on_select="rerun",
+                selection_mode="single-row",
+            )
+            try:
+                selected_rows_idx = table_event.selection.rows
+            except AttributeError:
+                selected_rows_idx = (table_event.get("selection", {}) or {}).get("rows", []) if isinstance(table_event, dict) else []
+            if selected_rows_idx:
+                selected_row = visible_segments_df.iloc[int(selected_rows_idx[0])]
+                new_segment_id = int(selected_row["segment_id"])
+                if st.session_state.get("semantic_selected_segment_id") != new_segment_id:
+                    st.session_state["semantic_selected_segment_id"] = new_segment_id
+        except TypeError:
+            st.dataframe(table_df, width="stretch", hide_index=True)
+            if not visible_segments_df.empty:
+                chosen_segment_id = st.selectbox(
+                    "Play salient segment",
+                    visible_segments_df["segment_id"].tolist(),
+                    format_func=lambda sid: (
+                        visible_segments_df.loc[visible_segments_df["segment_id"] == sid, "label"].iloc[0]
+                        + f" ({visible_segments_df.loc[visible_segments_df['segment_id'] == sid, 'start_sec'].iloc[0]:.2f}s)"
+                    ),
+                )
+                if st.button("Open selected segment"):
+                    st.session_state["semantic_selected_segment_id"] = int(chosen_segment_id)
+
+    selected_segment_id = st.session_state.get("semantic_selected_segment_id")
+    selected_rows = all_segments_df[all_segments_df["segment_id"] == selected_segment_id] if selected_segment_id else pd.DataFrame()
+    selected_segment = selected_rows.iloc[0] if not selected_rows.empty else None
+
+    with playback_slot.container():
+        st.markdown("**Audio playback**")
+        playback_col, action_col = st.columns([4, 1])
+        if selected_segment is not None:
+            st.caption(
+                f"Selected segment: {selected_segment['label']} "
+                f"({float(selected_segment['start_sec']):.2f}s to {float(selected_segment['end_sec']):.2f}s). "
+                "Playback is restricted to this segment until it is deselected."
+            )
+            playback_start_sec = float(selected_segment["start_sec"])
+            playback_end_sec = float(selected_segment["end_sec"])
+            playback_autoplay = True
+            playback_token = (
+                f"{result['result_key']}_{int(selected_segment['segment_id'])}_"
+                f"{playback_start_sec:.3f}_{playback_end_sec:.3f}"
+            )
+        else:
+            st.caption("Full uploaded audio.")
+            playback_start_sec = 0.0
+            playback_end_sec = None
+            playback_autoplay = False
+            playback_token = ""
+
+        with action_col:
+            if selected_segment is not None and st.button("Deselect segment", width="stretch"):
+                st.session_state.pop("semantic_selected_segment_id", None)
+                selected_segment = None
+                playback_start_sec = 0.0
+                playback_end_sec = None
+                playback_autoplay = False
+                playback_token = ""
+
+        with playback_col:
+            playback_time_seconds(
+                audio_bytes,
+                audio_name,
+                key=f"semantic_main_player_{result['result_key']}",
+                start_sec=playback_start_sec,
+                end_sec=playback_end_sec,
+                autoplay=playback_autoplay,
+                segment_token=playback_token,
+                poll_ms=500,
+                report_time=False,
+            )
+
+    with st.expander("Top adjustments", expanded=False):
+        st.dataframe(pd.DataFrame(summary.evidence["top_rule_impacts"]), width="stretch", hide_index=True)
+
+    with st.expander("Dominant Labels", expanded=False):
+        st.markdown("**Dominant non-silence labels**")
+        st.dataframe(pd.DataFrame(summary.dominant_non_silence_labels), width="stretch", hide_index=True)
 
     frame_times = pd.DataFrame(
         {
             "t_sec": t_sec,
-            "raw_top_1": [items[0]["label"] for items in (top_k_labels(row, labels, 1) for row in raw_scores)],
-            "adjusted_top_1": [items[0]["label"] for items in (top_k_labels(row, labels, 1) for row in adjusted_scores)],
+            "raw_top_1": [top_non_silence_label(row, labels) for row in raw_scores],
+            "adjusted_top_1": [top_non_silence_label(row, labels) for row in adjusted_scores],
         }
     )
     with st.expander("Top-1 timeline preview", expanded=False):
@@ -761,17 +1206,17 @@ if run_clicked and audio_file is not None:
         )
         timeline_fig.update_traces(marker={"size": 8})
         timeline_fig.update_layout(margin={"l": 10, "r": 10, "t": 10, "b": 10})
-        st.plotly_chart(timeline_fig, use_container_width=True)
-        st.dataframe(frame_times, use_container_width=True, hide_index=True)
+        st.plotly_chart(timeline_fig, width="stretch")
+        st.dataframe(frame_times, width="stretch", hide_index=True)
 
     download_col1, download_col2, download_col3 = st.columns(3)
     with download_col1:
         st.download_button(
             "Download semantic predictions JSONL",
-            data=dual_jsonl_bytes(t_sec, raw_scores, adjusted_scores, labels, int(top_k)),
-            file_name=f"{Path(audio_file.name).stem}_semantic_predictions.jsonl",
+            data=dual_jsonl_bytes(t_sec, raw_scores, adjusted_scores, labels, top_k_result),
+            file_name=f"{audio_stem}_semantic_predictions.jsonl",
             mime="application/jsonl",
-            use_container_width=True,
+            width="stretch",
         )
     with download_col2:
         npz_buffer = io.BytesIO()
@@ -786,15 +1231,46 @@ if run_clicked and audio_file is not None:
         st.download_button(
             "Download semantic matrix NPZ",
             data=npz_buffer.getvalue(),
-            file_name=f"{Path(audio_file.name).stem}_semantic_predictions.npz",
+            file_name=f"{audio_stem}_semantic_predictions.npz",
             mime="application/octet-stream",
-            use_container_width=True,
+            width="stretch",
         )
     with download_col3:
         st.download_button(
             "Download semantic summary JSON",
             data=summary_json_bytes(summary, context, adjustment_vector, labels, audio_stats),
-            file_name=f"{Path(audio_file.name).stem}_semantic_summary.json",
+            file_name=f"{audio_stem}_semantic_summary.json",
             mime="application/json",
-            use_container_width=True,
+            width="stretch",
+        )
+
+    export_col1, export_col2 = st.columns(2)
+    with export_col1:
+        st.download_button(
+            "Download visible salient segment manifest",
+            data=manifest_json_bytes(visible_segments_df, audio_name),
+            file_name=f"{audio_stem}_visible_salient_segments.json",
+            mime="application/json",
+            width="stretch",
+            disabled=visible_segments_df.empty,
+        )
+    with export_col2:
+        zip_key = visible_segments_key(visible_segments_df, audio_bytes, audio_name) if not visible_segments_df.empty else ""
+        zip_state_key = "semantic_prepared_chunks_zip"
+        zip_state = st.session_state.get(zip_state_key, {})
+        if st.button("Prepare visible salient audio chunks ZIP", width="stretch", disabled=visible_segments_df.empty):
+            with st.spinner("Preparing visible salient audio chunks..."):
+                zip_state = {
+                    "key": zip_key,
+                    "bytes": salient_chunks_zip_bytes(visible_segments_df, waveform, sr, audio_name),
+                }
+                st.session_state[zip_state_key] = zip_state
+        zip_ready = bool(zip_key and zip_state.get("key") == zip_key and zip_state.get("bytes"))
+        st.download_button(
+            "Download visible salient audio chunks ZIP",
+            data=zip_state.get("bytes", b"") if zip_ready else b"",
+            file_name=f"{audio_stem}_visible_salient_chunks.zip",
+            mime="application/zip",
+            width="stretch",
+            disabled=not zip_ready,
         )

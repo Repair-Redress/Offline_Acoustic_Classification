@@ -1181,10 +1181,10 @@ def plot_label_presence_over_time(
             yaxis_title="Audio category label",
             height=max(350, 18 * len(mat.index) + 140),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     except Exception:
         st.warning("Plotly heatmap unavailable. Install plotly to see the label timeline plot.")
-        st.dataframe(mat, use_container_width=True)
+        st.dataframe(mat, width="stretch")
 
 # --- UI Helper Functs ---
 

@@ -2,6 +2,7 @@ import argparse
 import csv
 import json
 import math
+import warnings
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -19,23 +20,43 @@ try:
 except ImportError:
     AudioSegment = None
 
-try:
-    import tflite_runtime.interpreter as tflite
+Interpreter = None
+_INTERPRETER_CLASS = None
 
-    Interpreter = tflite.Interpreter
-except ImportError:
+
+DEFAULT_CONTEXT_RULES_PATH = Path(__file__).resolve().parent / "context_rules.json"
+
+
+def get_interpreter_class():
+    global Interpreter, _INTERPRETER_CLASS
+    if _INTERPRETER_CLASS is not None:
+        return _INTERPRETER_CLASS
     try:
-        import tensorflow as tf
+        import tflite_runtime.interpreter as tflite
 
-        Interpreter = tf.lite.Interpreter
+        _INTERPRETER_CLASS = tflite.Interpreter
     except ImportError:
-        Interpreter = None
+        try:
+            import tensorflow as tf
+
+            _INTERPRETER_CLASS = tf.lite.Interpreter
+        except ImportError:
+            _INTERPRETER_CLASS = None
+    Interpreter = _INTERPRETER_CLASS
+    return _INTERPRETER_CLASS
+
+
+def create_interpreter(model_path: str):
+    interpreter_class = get_interpreter_class()
+    if interpreter_class is None:
+        raise RuntimeError("Install tensorflow, tflite_runtime, or ai_edge_litert to load the YAMNet model.")
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*tf\\.lite\\.Interpreter is deprecated.*")
+        return interpreter_class(model_path=model_path)
 
 
 def get_model_expected_len(model_path: str) -> int:
-    if Interpreter is None:
-        raise RuntimeError("Install tensorflow or tflite_runtime to load the YAMNet model.")
-    interp = Interpreter(model_path=model_path)
+    interp = create_interpreter(model_path)
     interp.allocate_tensors()
     input_details = interp.get_input_details()
     return int(input_details[0]["shape"][-1])
@@ -198,6 +219,76 @@ def normalize_token(text: str) -> str:
     return " ".join(str(text).strip().lower().replace("_", " ").split())
 
 
+def validate_context_rules_config(config: Dict[str, Any]) -> None:
+    if not isinstance(config, dict):
+        raise ValueError("Context rules config must be a JSON object.")
+
+    label_pattern_sets = config.get("label_pattern_sets")
+    if not isinstance(label_pattern_sets, dict) or not label_pattern_sets:
+        raise ValueError("Context rules config requires a non-empty label_pattern_sets object.")
+
+    for group_name, patterns in label_pattern_sets.items():
+        if not isinstance(group_name, str) or not group_name.strip():
+            raise ValueError("Every label pattern group must have a non-empty string name.")
+        if not isinstance(patterns, list) or not all(isinstance(item, str) and item.strip() for item in patterns):
+            raise ValueError(f"Label pattern group '{group_name}' must be a list of non-empty strings.")
+
+    rules = config.get("context_rules")
+    if not isinstance(rules, list):
+        raise ValueError("Context rules config requires context_rules as a list.")
+
+    known_groups = set(label_pattern_sets)
+    for idx, rule in enumerate(rules):
+        if not isinstance(rule, dict):
+            raise ValueError(f"Rule #{idx + 1} must be an object.")
+        name = rule.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"Rule #{idx + 1} requires a non-empty name.")
+        signals = rule.get("signals")
+        if not isinstance(signals, list) or not all(isinstance(item, str) and item.strip() for item in signals):
+            raise ValueError(f"Rule '{name}' requires signals as a list of non-empty strings.")
+
+        for section in ("boost", "suppress"):
+            values = rule.get(section, {})
+            if values is None:
+                continue
+            if not isinstance(values, dict):
+                raise ValueError(f"Rule '{name}' field '{section}' must be an object.")
+            unknown_groups = sorted(set(values) - known_groups)
+            if unknown_groups:
+                raise ValueError(f"Rule '{name}' references unknown {section} group(s): {', '.join(unknown_groups)}.")
+            for group_name, factor in values.items():
+                try:
+                    factor_value = float(factor)
+                except (TypeError, ValueError):
+                    raise ValueError(f"Rule '{name}' {section}.{group_name} must be numeric.") from None
+                if factor_value <= 0:
+                    raise ValueError(f"Rule '{name}' {section}.{group_name} must be greater than 0.")
+
+        suppress_labels = rule.get("suppress_labels", {})
+        if suppress_labels is None:
+            continue
+        if not isinstance(suppress_labels, dict):
+            raise ValueError(f"Rule '{name}' field 'suppress_labels' must be an object.")
+        for label_term, factor in suppress_labels.items():
+            if not isinstance(label_term, str) or not label_term.strip():
+                raise ValueError(f"Rule '{name}' suppress_labels keys must be non-empty strings.")
+            try:
+                factor_value = float(factor)
+            except (TypeError, ValueError):
+                raise ValueError(f"Rule '{name}' suppress_labels.{label_term} must be numeric.") from None
+            if factor_value <= 0:
+                raise ValueError(f"Rule '{name}' suppress_labels.{label_term} must be greater than 0.")
+
+
+def load_context_rules_config(path: Optional[str] = None) -> Dict[str, Any]:
+    config_path = Path(path) if path else DEFAULT_CONTEXT_RULES_PATH
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = json.load(f)
+    validate_context_rules_config(config)
+    return config
+
+
 @dataclass
 class ContextSignal:
     source: str
@@ -236,86 +327,9 @@ class SemanticSummary:
     evidence: Dict[str, Any]
 
 
-LABEL_PATTERN_SETS: Dict[str, List[str]] = {
-    "speech": ["speech", "conversation", "narration", "whisper", "babbling", "shout", "screaming"],
-    "music": ["music", "singing", "choir", "piano", "guitar", "drum", "musical instrument"],
-    "birds": ["bird", "chirp", "tweet", "owl", "crow", "pigeon"],
-    "wind": ["wind", "rustling leaves"],
-    "rain": ["rain", "thunderstorm", "thunder", "raindrop"],
-    "water": ["water", "stream", "ocean", "waves", "pour", "drip", "rain"],
-    "traffic": ["car", "bus", "motor vehicle", "truck", "motorcycle", "traffic", "engine", "vehicle horn", "car horn", "siren"],
-    "road": ["vehicle horn", "car horn", "honking", "siren", "brake", "skidding", "traffic noise"],
-    "construction": ["jackhammer", "drill", "hammer", "power tool", "construction", "chainsaw"],
-    "industrial": ["machine", "engine", "compressor", "mechanical fan", "tools"],
-    "indoors": ["typing", "printer", "keyboard", "clicking", "door", "drawer", "cutlery", "dishes", "speech"],
-    "office": ["typing", "clicking", "printer", "speech", "telephone", "computer keyboard"],
-    "residential": ["dog", "cat", "speech", "television", "vacuum cleaner", "doorbell"],
-    "nature": ["bird", "insect", "wind", "water", "frog", "cricket", "rain"],
-    "animals": ["dog", "cat", "bird", "frog", "insect", "livestock"],
-    "crowd": ["crowd", "cheering", "clapping", "applause", "speech"],
-}
-
-
-CONTEXT_RULES: List[Dict[str, Any]] = [
-    {
-        "name": "rainy_weather",
-        "signals": ["rain", "drizzle", "storm", "wet", "precipitation", "weathercode_rain"],
-        "boost": {"rain": 1.35, "water": 1.18, "wind": 1.1},
-        "suppress": {"construction": 0.94},
-    },
-    {
-        "name": "windy_weather",
-        "signals": ["windy", "gust", "wind", "weathercode_wind"],
-        "boost": {"wind": 1.3, "nature": 1.08, "traffic": 1.05},
-    },
-    {
-        "name": "urban_scene",
-        "signals": ["urban", "city", "downtown", "road", "street", "avenue", "traffic corridor"],
-        "boost": {"traffic": 1.3, "road": 1.18, "crowd": 1.08, "construction": 1.1},
-        "suppress": {"nature": 0.88},
-    },
-    {
-        "name": "rural_scene",
-        "signals": ["rural", "farmland", "countryside", "village", "field"],
-        "boost": {"nature": 1.28, "animals": 1.12, "wind": 1.06},
-        "suppress": {"traffic": 0.82, "construction": 0.9},
-    },
-    {
-        "name": "indoor_scene",
-        "signals": ["indoor", "indoors", "inside", "room", "hallway"],
-        "boost": {"indoors": 1.22, "office": 1.08, "speech": 1.04},
-        "suppress": {"birds": 0.72, "wind": 0.8, "rain": 0.84},
-    },
-    {
-        "name": "office_scene",
-        "signals": ["office", "meeting room", "workplace", "lab", "classroom"],
-        "boost": {"office": 1.35, "speech": 1.08, "indoors": 1.08},
-        "suppress": {"nature": 0.82},
-    },
-    {
-        "name": "outdoor_scene",
-        "signals": ["outdoor", "outdoors", "outside", "open air"],
-        "boost": {"nature": 1.18, "traffic": 1.06, "wind": 1.08},
-        "suppress": {"office": 0.82},
-        "suppress_labels": {
-            "inside, small room": 0.58,
-            "inside, large room or hall": 0.62,
-            "reverberation": 0.8,
-        },
-    },
-    {
-        "name": "industrial_scene",
-        "signals": ["industrial", "factory", "warehouse", "plant", "machinery"],
-        "boost": {"industrial": 1.35, "construction": 1.16, "traffic": 1.05},
-        "suppress": {"birds": 0.84},
-    },
-    {
-        "name": "residential_scene",
-        "signals": ["residential", "home", "apartment", "neighborhood"],
-        "boost": {"residential": 1.28, "speech": 1.06, "animals": 1.05},
-        "suppress": {"industrial": 0.86},
-    },
-]
+_CONTEXT_RULES_CONFIG = load_context_rules_config()
+LABEL_PATTERN_SETS: Dict[str, List[str]] = _CONTEXT_RULES_CONFIG["label_pattern_sets"]
+CONTEXT_RULES: List[Dict[str, Any]] = _CONTEXT_RULES_CONFIG["context_rules"]
 
 
 LOW_VALUE_SCENE_LABEL_TERMS = {
@@ -406,22 +420,30 @@ def match_label_indices(labels: Sequence[str], terms: Iterable[str]) -> List[int
     return indices
 
 
-def build_label_groups(labels: Sequence[str]) -> Dict[str, List[int]]:
+def build_label_groups(labels: Sequence[str], label_pattern_sets: Optional[Dict[str, List[str]]] = None) -> Dict[str, List[int]]:
     groups = {}
-    for name, patterns in LABEL_PATTERN_SETS.items():
+    for name, patterns in (label_pattern_sets or LABEL_PATTERN_SETS).items():
         groups[name] = match_label_indices(labels, [normalize_token(term) for term in patterns])
     return groups
 
 
-def build_context_adjustment(labels: Sequence[str], context: Dict[str, Any]) -> Tuple[np.ndarray, List[RuleImpact], List[ContextSignal]]:
+def build_context_adjustment(
+    labels: Sequence[str],
+    context: Dict[str, Any],
+    rules_config: Optional[Dict[str, Any]] = None,
+) -> Tuple[np.ndarray, List[RuleImpact], List[ContextSignal]]:
+    if rules_config is not None:
+        validate_context_rules_config(rules_config)
+    label_pattern_sets = (rules_config or _CONTEXT_RULES_CONFIG)["label_pattern_sets"]
+    context_rules = (rules_config or _CONTEXT_RULES_CONFIG)["context_rules"]
     weights = np.ones(len(labels), dtype=np.float32)
     impacts: List[RuleImpact] = []
     signals = extract_context_signals(context)
     signal_values = [signal.value for signal in signals]
-    label_groups = build_label_groups(labels)
+    label_groups = build_label_groups(labels, label_pattern_sets)
     norm_labels = [normalize_token(label) for label in labels]
 
-    for rule in CONTEXT_RULES:
+    for rule in context_rules:
         matched = [signal for signal in signals if any(token in signal.value for token in rule["signals"])]
         if not matched:
             continue
@@ -817,6 +839,7 @@ def main() -> None:
     )
     parser.add_argument("--audio", required=True, help="Path to an audio file.")
     parser.add_argument("--context_json", help="Optional JSON file with location/weather/scene metadata.")
+    parser.add_argument("--context_rules", default=str(DEFAULT_CONTEXT_RULES_PATH), help="JSON file containing context adjustment rules.")
     parser.add_argument("--model", default="yamnet.tflite")
     parser.add_argument("--labels", default="yamnet_class_map.csv")
     parser.add_argument("--sample_hz", type=float, default=1.0)
@@ -840,19 +863,20 @@ def main() -> None:
     out_summary = args.out_summary or outputs["summary"]
 
     labels = load_labels(args.labels)
+    rules_config = load_context_rules_config(args.context_rules)
     context = load_context(args.context_json)
     waveform, sr = load_audio(args.audio)
     waveform = to_mono(np.asarray(waveform)).astype(np.float32)
     audio_stats = compute_audio_stats(waveform, sr)
 
-    interp = Interpreter(model_path=args.model)
+    interp = create_interpreter(args.model)
     interp.allocate_tensors()
     t_sec, raw_scores = classify_waveform(interp, waveform, sr, args.sample_hz, args.window_s, args.avg_frames)
 
     if raw_scores.shape[1] != len(labels):
         raise ValueError(f"Model outputs {raw_scores.shape[1]} classes but labels contain {len(labels)} entries.")
 
-    adjustment_vector, impacts, context_signals = build_context_adjustment(labels, context)
+    adjustment_vector, impacts, context_signals = build_context_adjustment(labels, context, rules_config=rules_config)
     adjusted_scores = np.clip(raw_scores * adjustment_vector[None, :], 0.0, 1.0)
 
     summary = build_semantic_summary(

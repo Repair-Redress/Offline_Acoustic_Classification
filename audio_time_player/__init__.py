@@ -12,6 +12,11 @@ def audio_time_player(
     mime: str = "audio/wav",
     poll_ms: int = 250,
     height: int = 90,
+    start_sec: float = 0.0,
+    end_sec: Optional[float] = None,
+    autoplay: bool = False,
+    segment_token: str = "",
+    report_time: bool = True,
     key: Optional[str] = None,
 ) -> dict:
     """
@@ -23,6 +28,11 @@ def audio_time_player(
         mime=mime,
         poll_ms=int(poll_ms),
         height=int(height),
+        start_sec=float(start_sec or 0.0),
+        end_sec=None if end_sec is None else float(end_sec),
+        autoplay=bool(autoplay),
+        segment_token=str(segment_token or ""),
+        report_time=bool(report_time),
         key=key,
         default={"t": 0.0},
     )

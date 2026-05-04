@@ -16,6 +16,12 @@
       let timer = null;
       let pollMs = 250;
       let objectUrl = null;
+      let activeStartSec = null;
+      let activeEndSec = null;
+      let lastSegmentToken = "";
+      let reportTime = true;
+      let lastValueJson = "";
+      let segmentEndedReported = false;
 
       function sendMessage(type, data) {
         window.parent.postMessage(
@@ -31,11 +37,14 @@
       function setValue(extra) {
         const payload = Object.assign(
           {
-            t: audio.currentTime || 0,
+            t: reportTime ? audio.currentTime || 0 : 0,
             needs_audio: !audio.src,   // key signal to Python
           },
           extra || {}
         );
+        const payloadJson = JSON.stringify(payload);
+        if (payloadJson === lastValueJson) return;
+        lastValueJson = payloadJson;
         sendMessage("streamlit:setComponentValue", { value: payload });
       }
 
@@ -47,8 +56,29 @@
       function startTimer() {
         stopTimer();
         timer = setInterval(() => {
-          if (!audio.paused && !audio.ended) setValue();
+          if (activeStartSec !== null && audio.currentTime < activeStartSec) {
+            audio.currentTime = activeStartSec;
+          }
+          if (activeEndSec !== null && audio.currentTime >= activeEndSec) {
+            audio.pause();
+            if (!segmentEndedReported) {
+              segmentEndedReported = true;
+              setValue({ segment_ended: true });
+            }
+            return;
+          }
+          if (reportTime && !audio.paused && !audio.ended) setValue();
         }, pollMs);
+      }
+
+      function prepareForPlay() {
+        if (activeStartSec !== null && audio.currentTime < activeStartSec) {
+          audio.currentTime = activeStartSec;
+        }
+        if (activeEndSec !== null && audio.currentTime >= activeEndSec - 0.05) {
+          audio.currentTime = activeStartSec !== null ? activeStartSec : 0;
+          segmentEndedReported = false;
+        }
       }
 
       function b64ToBlob(b64, mime) {
@@ -65,13 +95,38 @@
         return new Blob(byteArrays, { type: mime || "audio/wav" });
       }
 
-      audio.addEventListener("play", startTimer);
+      audio.addEventListener("play", () => {
+        prepareForPlay();
+        startTimer();
+      });
       audio.addEventListener("pause", stopTimer);
       audio.addEventListener("ended", stopTimer);
-      audio.addEventListener("seeked", () => setValue());
+      audio.addEventListener("seeked", () => {
+        if (reportTime) setValue();
+      });
+      audio.addEventListener("seeking", () => {
+        if (activeStartSec !== null && audio.currentTime < activeStartSec) {
+          audio.currentTime = activeStartSec;
+        }
+        if (activeEndSec !== null && audio.currentTime > activeEndSec) {
+          audio.currentTime = activeStartSec !== null ? activeStartSec : activeEndSec;
+        }
+      });
       audio.addEventListener("loadedmetadata", () => setValue({ needs_audio: false }));
       audio.addEventListener("timeupdate", () => {
-        if (!audio.paused && !audio.ended) setValue();
+        if (activeStartSec !== null && audio.currentTime < activeStartSec) {
+          audio.currentTime = activeStartSec;
+          return;
+        }
+        if (activeEndSec !== null && audio.currentTime >= activeEndSec) {
+          audio.pause();
+          if (!segmentEndedReported) {
+            segmentEndedReported = true;
+            setValue({ segment_ended: true });
+          }
+          return;
+        }
+        if (reportTime && !audio.paused && !audio.ended) setValue();
       });
       audio.addEventListener("error", () => {
         const code = audio.error ? audio.error.code : null;
@@ -84,7 +139,18 @@
 
         const args = data.args || {};
         pollMs = Number(args.poll_ms || 250);
+        reportTime = args.report_time !== false;
         const h = Number(args.height || 90);
+        activeStartSec =
+          args.segment_token && Number.isFinite(Number(args.start_sec))
+            ? Number(args.start_sec)
+            : null;
+        activeEndSec =
+          args.end_sec === null || args.end_sec === undefined || args.end_sec === ""
+            ? null
+            : Number(args.end_sec);
+        const startSec = Number(args.start_sec || 0);
+        const segmentToken = String(args.segment_token || "");
 
         // If Python sends audio, load it via Blob URL (avoids huge data: URL issues)
         if (args.audio_b64 && args.audio_b64.length > 0) {
@@ -95,6 +161,7 @@
             objectUrl = URL.createObjectURL(blob);
             audio.src = objectUrl;
             audio.load();
+            segmentEndedReported = false;
             setValue({ needs_audio: false });
           } catch (e) {
             setValue({ needs_audio: true, error: "decode_failed" });
@@ -102,6 +169,26 @@
         } else {
           // If we have no src at all, request the audio again
           if (!audio.src) setValue({ needs_audio: true });
+        }
+
+        if (segmentToken && segmentToken !== lastSegmentToken) {
+          lastSegmentToken = segmentToken;
+          segmentEndedReported = false;
+          const seekAndMaybePlay = () => {
+            if (Number.isFinite(startSec)) audio.currentTime = Math.max(0, startSec);
+            if (args.autoplay) {
+              audio.play().catch(() => setValue({ autoplay_blocked: true }));
+            }
+            setValue({ segment_ended: false });
+          };
+          if (audio.readyState >= 1) {
+            seekAndMaybePlay();
+          } else {
+            audio.addEventListener("loadedmetadata", seekAndMaybePlay, { once: true });
+          }
+        } else if (!segmentToken) {
+          lastSegmentToken = "";
+          segmentEndedReported = false;
         }
 
         setFrameHeight(h);
